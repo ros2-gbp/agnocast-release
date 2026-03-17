@@ -1,4 +1,5 @@
 #include "agnocast/agnocast.hpp"
+#include "agnocast/node/agnocast_node.hpp"
 
 namespace agnocast
 {
@@ -9,8 +10,16 @@ SubscriptionBase::SubscriptionBase(rclcpp::Node * node, const std::string & topi
   validate_ld_preload();
 }
 
+SubscriptionBase::SubscriptionBase(
+  agnocast::Node * node, const std::string & topic_name)  // NOLINT(modernize-pass-by-value)
+: id_(0), topic_name_(node->get_node_topics_interface()->resolve_topic_name(topic_name))
+{
+  validate_ld_preload();
+}
+
 union ioctl_add_subscriber_args SubscriptionBase::initialize(
-  const rclcpp::QoS & qos, const bool is_take_sub, const std::string & node_name)
+  const rclcpp::QoS & qos, const bool is_take_sub, const bool ignore_local_publications,
+  const bool is_bridge, const std::string & node_name)
 {
   union ioctl_add_subscriber_args add_subscriber_args = {};
   add_subscriber_args.topic_name = {topic_name_.c_str(), topic_name_.size()};
@@ -18,7 +27,10 @@ union ioctl_add_subscriber_args SubscriptionBase::initialize(
   add_subscriber_args.qos_depth = static_cast<uint32_t>(qos.depth());
   add_subscriber_args.qos_is_transient_local =
     qos.durability() == rclcpp::DurabilityPolicy::TransientLocal;
+  add_subscriber_args.qos_is_reliable = qos.reliability() == rclcpp::ReliabilityPolicy::Reliable;
   add_subscriber_args.is_take_sub = is_take_sub;
+  add_subscriber_args.ignore_local_publications = ignore_local_publications;
+  add_subscriber_args.is_bridge = is_bridge;
   if (ioctl(agnocast_fd, AGNOCAST_ADD_SUBSCRIBER_CMD, &add_subscriber_args) < 0) {
     RCLCPP_ERROR(logger, "AGNOCAST_ADD_SUBSCRIBER_CMD failed: %s", strerror(errno));
     close(agnocast_fd);
@@ -26,6 +38,31 @@ union ioctl_add_subscriber_args SubscriptionBase::initialize(
   }
 
   return add_subscriber_args;
+}
+
+uint32_t get_publisher_count_core(const std::string & topic_name)
+{
+  union ioctl_get_publisher_num_args args = {};
+  args.topic_name = {topic_name.c_str(), topic_name.size()};
+  if (ioctl(agnocast_fd, AGNOCAST_GET_PUBLISHER_NUM_CMD, &args) < 0) {
+    RCLCPP_ERROR(logger, "AGNOCAST_GET_PUBLISHER_NUM_CMD failed: %s", strerror(errno));
+    close(agnocast_fd);
+    exit(EXIT_FAILURE);
+  }
+
+  uint32_t count = args.ret_publisher_num;
+  // If an R2A bridge exists, exclude the agnocast publisher created by the bridge
+  if (args.ret_r2a_bridge_exist && count > 0) {
+    count--;
+  }
+
+  uint32_t ros2_count = args.ret_ros2_publisher_num;
+  // If an A2R bridge exists, exclude the ROS 2 publisher created by the bridge
+  if (args.ret_a2r_bridge_exist && ros2_count > 0) {
+    ros2_count--;
+  }
+
+  return count + ros2_count;
 }
 
 mqd_t open_mq_for_subscription(
@@ -42,7 +79,10 @@ mqd_t open_mq_for_subscription(
   const int mq_mode = 0666;
   mqd_t mq = mq_open(mq_name.c_str(), O_CREAT | O_RDONLY | O_NONBLOCK, mq_mode, &attr);
   if (mq == -1) {
-    RCLCPP_ERROR(logger, "mq_open failed: %s", strerror(errno));
+    RCLCPP_ERROR_STREAM(
+      logger, "mq_open failed for topic '" << topic_name << "' (subscriber_id=" << subscriber_id
+                                           << ", mq_name='" << mq_name
+                                           << "'): " << strerror(errno));
     close(agnocast_fd);
     exit(EXIT_FAILURE);
   }
@@ -55,30 +95,20 @@ void remove_mq(const std::pair<mqd_t, std::string> & mq_subscription)
 {
   /* The message queue is destroyed after all the publisher processes close it. */
   if (mq_close(mq_subscription.first) == -1) {
-    RCLCPP_ERROR(logger, "mq_close failed: %s", strerror(errno));
+    RCLCPP_ERROR_STREAM(
+      logger,
+      "mq_close failed for mq_name='" << mq_subscription.second << "': " << strerror(errno));
   }
   if (mq_unlink(mq_subscription.second.c_str()) == -1) {
-    RCLCPP_ERROR(logger, "mq_unlink failed: %s", strerror(errno));
+    RCLCPP_ERROR_STREAM(
+      logger,
+      "mq_unlink failed for mq_name='" << mq_subscription.second << "': " << strerror(errno));
   }
 }
 
-rclcpp::CallbackGroup::SharedPtr get_valid_callback_group(
-  const rclcpp::node_interfaces::NodeBaseInterface::SharedPtr & node,
-  const SubscriptionOptions & options)
+rclcpp::CallbackGroup::SharedPtr get_default_callback_group_for_tracepoint(agnocast::Node * node)
 {
-  rclcpp::CallbackGroup::SharedPtr callback_group = options.callback_group;
-
-  if (callback_group) {
-    if (!node->callback_group_in_node(callback_group)) {
-      RCLCPP_ERROR(logger, "Cannot create agnocast subscription, callback group not in node.");
-      close(agnocast_fd);
-      exit(EXIT_FAILURE);
-    }
-  } else {
-    callback_group = node->get_default_callback_group();
-  }
-
-  return callback_group;
+  return node->get_node_base_interface()->get_default_callback_group();
 }
 
 }  // namespace agnocast

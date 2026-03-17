@@ -10,26 +10,25 @@ class TestTakeSubscriber : public rclcpp::Node
 {
   rclcpp::TimerBase::SharedPtr timer_;
   agnocast::TakeSubscription<std_msgs::msg::Int64>::SharedPtr sub_;
-  uint64_t count_;
-  uint64_t sub_num_;
   bool forever_;
+  int64_t target_end_id_;
 
   void timer_callback()
   {
     auto message = sub_->take();
-    if (message) {
-      RCLCPP_INFO(this->get_logger(), "Receiving %ld.", message->data);
-      count_++;
+
+    if (!message) {
+      return;
     }
 
-    if (count_ == sub_num_) {
+    RCLCPP_INFO(this->get_logger(), "Receiving %ld.", message->data);
+
+    if (message->data == target_end_id_) {
       RCLCPP_INFO(this->get_logger(), "All messages received. Shutting down.");
       std::cout << std::flush;
 
       if (!forever_) {
         rclcpp::shutdown();
-      } else {
-        count_++;
       }
     }
   }
@@ -38,11 +37,14 @@ public:
   explicit TestTakeSubscriber(const rclcpp::NodeOptions & options)
   : Node("test_take_subscription", options)
   {
+    this->declare_parameter<std::string>("topic_name", "/test_topic");
     this->declare_parameter<int64_t>("qos_depth", 10);
     this->declare_parameter<bool>("transient_local", true);
-    this->declare_parameter<int64_t>("sub_num", 10);
     this->declare_parameter<bool>("forever", false);
+    this->declare_parameter<int64_t>("target_end_id", 0);
+    std::string topic_name = this->get_parameter("topic_name").as_string();
     forever_ = this->get_parameter("forever").as_bool();
+    target_end_id_ = this->get_parameter("target_end_id").as_int();
 
     int64_t qos_depth = this->get_parameter("qos_depth").as_int();
     rclcpp::QoS qos = rclcpp::QoS(rclcpp::KeepLast(qos_depth));
@@ -50,10 +52,8 @@ public:
       qos.transient_local();
     }
 
-    count_ = 0;
-    sub_num_ = this->get_parameter("sub_num").as_int();
     sub_ =
-      std::make_shared<agnocast::TakeSubscription<std_msgs::msg::Int64>>(this, "/test_topic", qos);
+      std::make_shared<agnocast::TakeSubscription<std_msgs::msg::Int64>>(this, topic_name, qos);
     timer_ = this->create_wall_timer(10ms, std::bind(&TestTakeSubscriber::timer_callback, this));
   }
 };

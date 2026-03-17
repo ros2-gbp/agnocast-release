@@ -9,12 +9,13 @@ repos:
     rev: v0.41.0
     hooks:
       - id: markdownlint
+        language_version: 20.11.0
         args: [-c, .markdownlint.yaml, --fix]
   
   - repo: local
     hooks:
       - id: kunit
         name: Run KUnit tests
-        entry: scripts/run_kunit
+        entry: scripts/test/run_kunit.bash
         language: system
         types: [c]

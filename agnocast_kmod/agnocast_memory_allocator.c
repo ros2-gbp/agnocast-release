@@ -1,129 +1,230 @@
 #include "agnocast_memory_allocator.h"
 
+#include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/moduleparam.h>
+#include <linux/overflow.h>
+#include <linux/slab.h>
+#include <linux/spinlock.h>
 
 MODULE_LICENSE("Dual BSD/GPL");
 
-static const uint64_t MEMPOOL_128MB_SIZE = 134217728;  // 128 * 1024 * 1024
-static const uint64_t MEMPOOL_1GB_SIZE = 1073741824;   // 1 * 1024 * 1024 * 1024
-static const uint64_t MEMPOOL_8GB_SIZE = 8589934592;   // 8 * 1024 * 1024 * 1024
+static struct mempool_entry * mempool_entries;
+static DEFINE_SPINLOCK(mempool_lock);
 
-static struct mempool_entry mempool_entries[MEMPOOL_TOTAL_NUM];
+#define DEFAULT_MEMPOOL_NUM 4096
+#define DEFAULT_MEMPOOL_START_ADDR 0x40000000000ULL
+#define DEFAULT_MEMPOOL_SIZE_GB 16
 
-void init_memory_allocator(void)
+// Module parameter: number of memory pools
+int mempool_num = DEFAULT_MEMPOOL_NUM;
+module_param(mempool_num, int, 0444);
+MODULE_PARM_DESC(mempool_num, "Number of memory pools (default: 4096)");
+
+// Module parameter: start address of the allocator
+unsigned long mempool_start_addr = DEFAULT_MEMPOOL_START_ADDR;
+module_param(mempool_start_addr, ulong, 0444);
+MODULE_PARM_DESC(
+  mempool_start_addr, "Start address of the memory allocator (default: 0x40000000000)");
+
+// Module parameter: mempool size in GB
+int mempool_size_gb = DEFAULT_MEMPOOL_SIZE_GB;
+module_param(mempool_size_gb, int, 0444);
+MODULE_PARM_DESC(mempool_size_gb, "Default mempool size in GB (default: 16)");
+
+uint64_t mempool_size_bytes = 0;
+
+int init_memory_allocator(void)
 {
-  // TODO(Ryuta Kambe): we assume that the address from 0x40000000000 to 0x120FFFFFFFFF is available
-  uint64_t addr = 0x40000000000;
+  uint64_t addr = (uint64_t)mempool_start_addr;
+  uint64_t total_size;
+  uint64_t end_addr;
 
-  for (int i = 0; i < MEMPOOL_128MB_NUM; i++) {
+  if (mempool_num <= 0) {
+    pr_warn("Agnocast: invalid mempool_num=%d, must be positive\n", mempool_num);
+    return -EINVAL;
+  }
+
+  if (mempool_size_gb <= 0) {
+    pr_warn("Agnocast: invalid mempool_size_gb=%d, must be positive\n", mempool_size_gb);
+    return -EINVAL;
+  }
+
+  mempool_size_bytes = (uint64_t)mempool_size_gb * 1024ULL * 1024ULL * 1024ULL;
+
+  if (check_mul_overflow((uint64_t)mempool_num, mempool_size_bytes, &total_size)) {
+    pr_warn(
+      "Agnocast: overflow computing total memory size (mempool_num=%d, mempool_size_gb=%d)\n",
+      mempool_num, mempool_size_gb);
+    return -EINVAL;
+  }
+
+  if (check_add_overflow(addr, total_size, &end_addr)) {
+    pr_warn(
+      "Agnocast: overflow computing end address "
+      "(mempool_start_addr=0x%lx, total_size=0x%llx)\n",
+      mempool_start_addr, total_size);
+    return -EINVAL;
+  }
+
+  mempool_entries = kvcalloc(mempool_num, sizeof(*mempool_entries), GFP_KERNEL);
+  if (!mempool_entries) {
+    pr_err("Agnocast: Failed to allocate mempool_entries array\n");
+    return -ENOMEM;
+  }
+
+  pr_info(
+    "Agnocast: Initializing memory allocator with %d pools, pool size: %llu bytes (%d GB), "
+    "start address: 0x%llx\n",
+    mempool_num, mempool_size_bytes, mempool_size_gb, addr);
+
+  if (mempool_num != DEFAULT_MEMPOOL_NUM) {
+    pr_warn(
+      "Agnocast: mempool_num=%d is not the default value (%d). "
+      "This parameter is experimental and may be removed or changed in future versions.\n",
+      mempool_num, DEFAULT_MEMPOOL_NUM);
+  }
+
+  if ((uint64_t)mempool_start_addr != DEFAULT_MEMPOOL_START_ADDR) {
+    pr_warn(
+      "Agnocast: mempool_start_addr=0x%lx is not the default value (0x%llx). "
+      "This parameter is experimental and may be removed or changed in future versions.\n",
+      mempool_start_addr, DEFAULT_MEMPOOL_START_ADDR);
+  }
+
+  if (mempool_size_gb != DEFAULT_MEMPOOL_SIZE_GB) {
+    pr_warn(
+      "Agnocast: mempool_size_gb=%d is not the default value (%d). "
+      "This parameter is experimental and may be removed or changed in future versions.\n",
+      mempool_size_gb, DEFAULT_MEMPOOL_SIZE_GB);
+  }
+
+  {
+    uint64_t limit_85tb = 85ULL * 1024ULL * 1024ULL * 1024ULL * 1024ULL;
+    if (end_addr > limit_85tb) {
+      pr_warn(
+        "Agnocast: memory region end address 0x%llx exceeds 85TB (0x%llx). "
+        "This may cause address space conflicts.\n",
+        end_addr, limit_85tb);
+    }
+  }
+
+  for (int i = 0; i < mempool_num; i++) {
     mempool_entries[i].addr = addr;
-    mempool_entries[i].pool_size = MEMPOOL_128MB_SIZE;
     mempool_entries[i].mapped_num = 0;
-    for (int j = 0; j < MAX_PROCESS_NUM_PER_MEMPOOL; j++) {
-      mempool_entries[i].mapped_pids[j] = -1;
-    }
-    addr += MEMPOOL_128MB_SIZE;
+    INIT_LIST_HEAD(&mempool_entries[i].mapped_pid_head);
+    addr += mempool_size_bytes;
   }
 
-  for (int i = 0; i < MEMPOOL_1GB_NUM; i++) {
-    mempool_entries[i + MEMPOOL_128MB_NUM].addr = addr;
-    mempool_entries[i + MEMPOOL_128MB_NUM].pool_size = MEMPOOL_1GB_SIZE;
-    mempool_entries[i + MEMPOOL_128MB_NUM].mapped_num = 0;
-    for (int j = 0; j < MAX_PROCESS_NUM_PER_MEMPOOL; j++) {
-      mempool_entries[i + MEMPOOL_128MB_NUM].mapped_pids[j] = -1;
-    }
-    addr += MEMPOOL_1GB_SIZE;
-  }
-
-  for (int i = 0; i < MEMPOOL_8GB_NUM; i++) {
-    mempool_entries[i + MEMPOOL_128MB_NUM + MEMPOOL_1GB_NUM].addr = addr;
-    mempool_entries[i + MEMPOOL_128MB_NUM + MEMPOOL_1GB_NUM].pool_size = MEMPOOL_8GB_SIZE;
-    mempool_entries[i + MEMPOOL_128MB_NUM + MEMPOOL_1GB_NUM].mapped_num = 0;
-    for (int j = 0; j < MAX_PROCESS_NUM_PER_MEMPOOL; j++) {
-      mempool_entries[i + MEMPOOL_128MB_NUM + MEMPOOL_1GB_NUM].mapped_pids[j] = -1;
-    }
-    addr += MEMPOOL_8GB_SIZE;
-  }
+  return 0;
 }
 
-struct mempool_entry * assign_memory(const pid_t pid, const uint64_t size)
+struct mempool_entry * assign_memory(const pid_t pid)
 {
-  if (size <= MEMPOOL_128MB_SIZE) {
-    for (int i = 0; i < MEMPOOL_128MB_NUM; i++) {
-      if (mempool_entries[i].mapped_num == 0) {
-        mempool_entries[i].mapped_num = 1;
-        mempool_entries[i].mapped_pids[0] = pid;
-        return &mempool_entries[i];
-      }
+  struct mempool_entry * result = NULL;
+  struct mapped_pid_entry * new_entry;
+  unsigned long flags;
+
+  // Allocate outside spinlock because kmalloc with GFP_KERNEL may sleep
+  new_entry = kmalloc(sizeof(*new_entry), GFP_KERNEL);
+  if (!new_entry) {
+    return NULL;
+  }
+  new_entry->pid = pid;
+
+  spin_lock_irqsave(&mempool_lock, flags);
+  for (int i = 0; i < mempool_num; i++) {
+    if (mempool_entries[i].mapped_num == 0) {
+      list_add(&new_entry->list, &mempool_entries[i].mapped_pid_head);
+      mempool_entries[i].mapped_num = 1;
+      result = &mempool_entries[i];
+      break;
     }
   }
+  spin_unlock_irqrestore(&mempool_lock, flags);
 
-  if (size <= MEMPOOL_1GB_SIZE) {
-    for (int i = MEMPOOL_128MB_NUM; i < MEMPOOL_128MB_NUM + MEMPOOL_1GB_NUM; i++) {
-      if (mempool_entries[i].mapped_num == 0) {
-        mempool_entries[i].mapped_num = 1;
-        mempool_entries[i].mapped_pids[0] = pid;
-        return &mempool_entries[i];
-      }
-    }
+  if (!result) {
+    kfree(new_entry);
   }
 
-  if (size <= MEMPOOL_8GB_SIZE) {
-    for (int i = MEMPOOL_128MB_NUM + MEMPOOL_1GB_NUM;
-         i < MEMPOOL_128MB_NUM + MEMPOOL_1GB_NUM + MEMPOOL_8GB_NUM; i++) {
-      if (mempool_entries[i].mapped_num == 0) {
-        mempool_entries[i].mapped_num = 1;
-        mempool_entries[i].mapped_pids[0] = pid;
-        return &mempool_entries[i];
-      }
-    }
-  }
-
-  return NULL;
+  return result;
 }
 
 int reference_memory(struct mempool_entry * mempool_entry, const pid_t pid)
 {
-  if (mempool_entry->mapped_num == MAX_PROCESS_NUM_PER_MEMPOOL) {
-    return -ENOBUFS;
-  }
+  struct mapped_pid_entry * new_entry;
+  struct mapped_pid_entry * entry;
+  unsigned long flags;
 
-  for (int i = 0; i < mempool_entry->mapped_num; i++) {
-    if (mempool_entry->mapped_pids[i] == pid) {
+  // Allocate outside spinlock because kmalloc with GFP_KERNEL may sleep
+  new_entry = kmalloc(sizeof(*new_entry), GFP_KERNEL);
+  if (!new_entry) {
+    return -ENOMEM;
+  }
+  new_entry->pid = pid;
+
+  spin_lock_irqsave(&mempool_lock, flags);
+  list_for_each_entry(entry, &mempool_entry->mapped_pid_head, list)
+  {
+    if (entry->pid == pid) {
+      spin_unlock_irqrestore(&mempool_lock, flags);
+      kfree(new_entry);
       return -EEXIST;
     }
   }
-
-  mempool_entry->mapped_pids[mempool_entry->mapped_num] = pid;
+  list_add(&new_entry->list, &mempool_entry->mapped_pid_head);
   mempool_entry->mapped_num++;
+  spin_unlock_irqrestore(&mempool_lock, flags);
 
   return 0;
 }
 
 void free_memory(const pid_t pid)
 {
-  for (int i = 0; i < MEMPOOL_TOTAL_NUM; i++) {
-    for (int j = 0; j < mempool_entries[i].mapped_num; j++) {
-      if (mempool_entries[i].mapped_pids[j] == pid) {
-        for (int k = j; k < MAX_PROCESS_NUM_PER_MEMPOOL - 1; k++) {
-          mempool_entries[i].mapped_pids[k] = mempool_entries[i].mapped_pids[k + 1];
-        }
-        mempool_entries[i].mapped_pids[MAX_PROCESS_NUM_PER_MEMPOOL - 1] = -1;
+  struct mapped_pid_entry * entry;
+  struct mapped_pid_entry * tmp;
+  unsigned long flags;
+
+  spin_lock_irqsave(&mempool_lock, flags);
+  for (int i = 0; i < mempool_num; i++) {
+    list_for_each_entry_safe(entry, tmp, &mempool_entries[i].mapped_pid_head, list)
+    {
+      if (entry->pid == pid) {
+        list_del(&entry->list);
+        kfree(entry);
         mempool_entries[i].mapped_num--;
         break;
       }
     }
   }
+  spin_unlock_irqrestore(&mempool_lock, flags);
 }
 
-#ifdef KUNIT_BUILD
 void exit_memory_allocator(void)
 {
-  for (int i = 0; i < MEMPOOL_TOTAL_NUM; i++) {
-    mempool_entries[i].mapped_num = 0;
-    for (int j = 0; j < MAX_PROCESS_NUM_PER_MEMPOOL; j++) {
-      mempool_entries[i].mapped_pids[j] = -1;
+  struct mapped_pid_entry * entry;
+  struct mapped_pid_entry * tmp;
+  unsigned long flags;
+
+  spin_lock_irqsave(&mempool_lock, flags);
+  for (int i = 0; i < mempool_num; i++) {
+    list_for_each_entry_safe(entry, tmp, &mempool_entries[i].mapped_pid_head, list)
+    {
+      list_del(&entry->list);
+      kfree(entry);
     }
+    mempool_entries[i].mapped_num = 0;
   }
+  spin_unlock_irqrestore(&mempool_lock, flags);
 }
-#endif
+
+void cleanup_memory_allocator(void)
+{
+  if (!mempool_entries) {
+    return;
+  }
+
+  exit_memory_allocator();
+  kvfree(mempool_entries);
+  mempool_entries = NULL;
+}
