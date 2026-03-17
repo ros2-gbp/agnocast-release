@@ -1,13 +1,29 @@
 #include "agnocast.h"
+#include "agnocast_kunit/agnocast_kunit_add_bridge.h"
 #include "agnocast_kunit/agnocast_kunit_add_process.h"
 #include "agnocast_kunit/agnocast_kunit_add_publisher.h"
 #include "agnocast_kunit/agnocast_kunit_add_subscriber.h"
-#include "agnocast_kunit/agnocast_kunit_decrement_rc.h"
+#include "agnocast_kunit/agnocast_kunit_bridge_shutdown.h"
+#include "agnocast_kunit/agnocast_kunit_check_and_request_bridge_shutdown.h"
 #include "agnocast_kunit/agnocast_kunit_do_exit.h"
+#include "agnocast_kunit/agnocast_kunit_get_node_publisher_topics.h"
+#include "agnocast_kunit/agnocast_kunit_get_node_subscriber_topics.h"
+#include "agnocast_kunit/agnocast_kunit_get_publisher_num.h"
+#include "agnocast_kunit/agnocast_kunit_get_publisher_qos.h"
 #include "agnocast_kunit/agnocast_kunit_get_subscriber_num.h"
-#include "agnocast_kunit/agnocast_kunit_increment_rc.h"
+#include "agnocast_kunit/agnocast_kunit_get_subscriber_qos.h"
+#include "agnocast_kunit/agnocast_kunit_get_topic_publisher_info.h"
+#include "agnocast_kunit/agnocast_kunit_get_topic_subscriber_info.h"
+#include "agnocast_kunit/agnocast_kunit_get_version.h"
+#include "agnocast_kunit/agnocast_kunit_init_memory_allocator.h"
 #include "agnocast_kunit/agnocast_kunit_publish_msg.h"
 #include "agnocast_kunit/agnocast_kunit_receive_msg.h"
+#include "agnocast_kunit/agnocast_kunit_release_sub_ref.h"
+#include "agnocast_kunit/agnocast_kunit_remove_bridge.h"
+#include "agnocast_kunit/agnocast_kunit_remove_publisher.h"
+#include "agnocast_kunit/agnocast_kunit_remove_subscriber.h"
+#include "agnocast_kunit/agnocast_kunit_set_ros2_publisher_num.h"
+#include "agnocast_kunit/agnocast_kunit_set_ros2_subscriber_num.h"
 #include "agnocast_kunit/agnocast_kunit_take_msg.h"
 #include "agnocast_memory_allocator.h"
 
@@ -18,14 +34,30 @@ MODULE_LICENSE("Dual BSD/GPL");
 struct kunit_case agnocast_test_cases[] = {
   TEST_CASES_ADD_SUBSCRIBER,
   TEST_CASES_ADD_PUBLISHER,
-  TEST_CASES_INCREMENT_RC,
-  TEST_CASES_DECREMENT_RC,
+  TEST_CASES_REMOVE_SUBSCRIBER,
+  TEST_CASES_REMOVE_PUBLISHER,
+  TEST_CASES_RELEASE_SUB_REF,
   TEST_CASES_RECEIVE_MSG,
   TEST_CASES_PUBLISH_MSG,
   TEST_CASES_TAKE_MSG,
   TEST_CASES_ADD_PROCESS,
+  TEST_CASES_BRIDGE_SHUTDOWN,
+  TEST_CASES_CHECK_AND_REQUEST_BRIDGE_SHUTDOWN,
   TEST_CASES_GET_SUBSCRIBER_NUM,
+  TEST_CASES_GET_SUBSCRIBER_QOS,
+  TEST_CASES_GET_PUBLISHER_NUM,
+  TEST_CASES_GET_PUBLISHER_QOS,
+  TEST_CASES_ADD_BRIDGE,
+  TEST_CASES_REMOVE_BRIDGE,
+  TEST_CASES_SET_ROS2_SUBSCRIBER_NUM,
+  TEST_CASES_SET_ROS2_PUBLISHER_NUM,
   TEST_CASES_DO_EXIT,
+  TEST_CASES_GET_NODE_SUBSCRIBER_TOPICS,
+  TEST_CASES_GET_NODE_PUBLISHER_TOPICS,
+  TEST_CASES_GET_TOPIC_SUBSCRIBER_INFO,
+  TEST_CASES_GET_TOPIC_PUBLISHER_INFO,
+  TEST_CASES_GET_VERSION,
+  TEST_CASES_INIT_MEMORY_ALLOCATOR,
   {},
 };
 
@@ -44,17 +76,29 @@ static int agnocast_test_suite_init(struct kunit_suite * test_suite)
 {
   int ret;
 
-  agnocast_init_mutexes();
-
-  agnocast_init_device();
+  ret = agnocast_init_device();
+  if (ret < 0) return ret;
 
   ret = agnocast_init_kthread();
-  if (ret < 0) return ret;
+  if (ret < 0) {
+    agnocast_exit_device();
+    return ret;
+  }
 
-  ret = agnocast_init_kprobe();
-  if (ret < 0) return ret;
+  ret = agnocast_init_exit_hook();
+  if (ret < 0) {
+    agnocast_exit_kthread();
+    agnocast_exit_device();
+    return ret;
+  }
 
-  init_memory_allocator();
+  ret = init_memory_allocator();
+  if (ret < 0) {
+    agnocast_exit_exit_hook();
+    agnocast_exit_kthread();
+    agnocast_exit_device();
+    return ret;
+  }
 
   return 0;
 }
@@ -62,7 +106,8 @@ static int agnocast_test_suite_init(struct kunit_suite * test_suite)
 static void agnocast_test_suite_exit(struct kunit_suite * test_suite)
 {
   agnocast_exit_kthread();
-  agnocast_exit_kprobe();
+  agnocast_exit_exit_hook();
+  cleanup_memory_allocator();
   agnocast_exit_device();
 }
 
