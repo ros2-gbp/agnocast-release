@@ -2,14 +2,24 @@
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_components/component_manager.hpp"
 
+#include <glog/logging.h>
+
 #include <chrono>
 
 int main(int argc, char * argv[])
 {
+  google::InitGoogleLogging(argv[0]);  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+  google::InstallFailureSignalHandler();
+
   try {
     using namespace std::chrono;
 
     rclcpp::init(argc, argv);
+
+    RCLCPP_WARN(
+      rclcpp::get_logger("agnocast_component_container_mt"),
+      "agnocastlib::agnocast_component_container_mt is deprecated. "
+      "Please use agnocast_components::agnocast_component_container_mt instead.");
 
     rclcpp::NodeOptions options;
     options.allow_undeclared_parameters(true);
@@ -22,10 +32,13 @@ int main(int argc, char * argv[])
     const size_t number_of_agnocast_threads =
       node->get_parameter_or("number_of_agnocast_threads", 0);
     const bool yield_before_execute = node->get_parameter_or("yield_before_execute", false);
+    const int ros2_next_exec_timeout_ms = node->get_parameter_or("ros2_next_exec_timeout_ms", -1);
     const nanoseconds ros2_next_exec_timeout_ns =
-      nanoseconds(node->get_parameter_or("ros2_next_exec_timeout_ms", 10) * 1000 * 1000);
+      ros2_next_exec_timeout_ms == -1
+        ? nanoseconds(-1)
+        : nanoseconds(static_cast<int64_t>(ros2_next_exec_timeout_ms) * 1000 * 1000);
     const int agnocast_next_exec_timeout_ms =
-      node->get_parameter_or("agnocast_next_exec_timeout_ms", 10);
+      node->get_parameter_or("agnocast_next_exec_timeout_ms", 50);
 
     auto executor = std::make_shared<agnocast::MultiThreadedAgnocastExecutor>(
       rclcpp::ExecutorOptions{}, number_of_ros2_threads, number_of_agnocast_threads,

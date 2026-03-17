@@ -1,4 +1,5 @@
 #include "agnocast/agnocast_callback_isolated_executor.hpp"
+#include "agnocast/node/agnocast_node.hpp"
 
 #include <gtest/gtest.h>
 
@@ -66,4 +67,109 @@ TEST_F(CallbackIsolatedAgnocastExecutorTest, get_all_callback_groups)
   executor->remove_node(node2);
   groups = executor->get_all_callback_groups();
   EXPECT_EQ(groups.size(), 0);
+}
+
+// Verify that agnocast::Node's get_notify_guard_condition() does not throw
+// when created with a valid context (i.e., after rclcpp::init()).
+// This is required because rclcpp::Executor::add_node() calls
+// get_notify_guard_condition() in add_callback_group_to_map() to register
+// the node's guard condition in the executor's wait set.
+// agnocast::Node uses its own epoll-based dispatch and does not need this
+// guard condition, but it must be available for executor compatibility.
+TEST_F(CallbackIsolatedAgnocastExecutorTest, agnocast_node_add_to_executor)
+{
+  auto node = std::make_shared<agnocast::Node>("test_agnocast_node");
+  auto node_base = node->get_node_base_interface();
+
+  EXPECT_NO_THROW(node_base->get_notify_guard_condition());
+  EXPECT_NO_THROW(executor->add_node(node_base));
+
+  auto groups = executor->get_automatically_added_callback_groups_from_nodes();
+  EXPECT_EQ(groups.size(), 1);
+
+  executor->remove_node(node_base);
+  groups = executor->get_automatically_added_callback_groups_from_nodes();
+  EXPECT_EQ(groups.size(), 0);
+}
+
+TEST_F(CallbackIsolatedAgnocastExecutorTest, cancel)
+{
+  // Arrange
+  auto node = std::make_shared<rclcpp::Node>("test_node");
+  bool timer_called = false;
+  auto timer = node->create_wall_timer(
+    std::chrono::milliseconds(10), [&timer_called]() { timer_called = true; });
+  executor->add_node(node);
+  bool spin_finished = false;
+  std::thread spin_thread([this, &spin_finished]() {
+    executor->spin();
+    spin_finished = true;
+  });
+  while (!timer_called) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+
+  // Act
+  EXPECT_NO_THROW(executor->cancel());
+  if (spin_thread.joinable()) {
+    spin_thread.join();
+  }
+
+  // Assert
+  EXPECT_TRUE(spin_finished) << "Spin should have finished after cancel";
+}
+
+// Regression test: cancel() called from within a child thread's callback must not deadlock.
+// cancel() acquires child_resources_mutex_, so spin()'s shutdown path must not hold
+// that mutex while joining child threads.
+//
+// Deadlock sequence if child_resources_mutex_ is held during thread join:
+//   1. Timer callback fires in a child thread, starts a long sleep
+//   2. External cancel() sets spinning=false, causing spin()'s monitoring loop to exit
+//   3. spin()'s shutdown acquires child_resources_mutex_ and tries to join child threads
+//   4. Timer callback wakes from sleep, calls cancel(), blocks on child_resources_mutex_
+//   5. Child thread can't exit → spin() can't join → deadlock
+TEST_F(CallbackIsolatedAgnocastExecutorTest, cancel_from_child_callback_does_not_deadlock)
+{
+  // Arrange
+  auto node = std::make_shared<rclcpp::Node>("test_node");
+  std::atomic_bool callback_started{false};
+  auto timer = node->create_wall_timer(std::chrono::milliseconds(10), [&]() {
+    callback_started = true;
+    // Keep this callback alive while external cancel triggers spin()'s shutdown path.
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    // Call cancel() on the parent executor. If child_resources_mutex_ is held during
+    // thread join in spin()'s shutdown, this blocks and causes a deadlock.
+    executor->cancel();
+  });
+  executor->add_node(node);
+
+  std::atomic_bool spin_finished{false};
+  std::thread spin_thread([this, &spin_finished]() {
+    executor->spin();
+    spin_finished = true;
+  });
+
+  // Wait for the child callback to start executing.
+  while (!callback_started) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+
+  // Act: cancel externally while the child callback is still sleeping.
+  executor->cancel();
+
+  // Assert: spin() must exit within the timeout. A deadlock would hang forever.
+  auto start = std::chrono::steady_clock::now();
+  constexpr auto timeout = std::chrono::seconds(10);
+  while (!spin_finished) {
+    ASSERT_LT(std::chrono::steady_clock::now() - start, timeout)
+      << "Deadlock detected: spin() did not exit after cancel() from child callback";
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+
+  if (spin_thread.joinable()) {
+    spin_thread.join();
+  }
+
+  EXPECT_TRUE(spin_finished);
 }
