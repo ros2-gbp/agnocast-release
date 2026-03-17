@@ -8,6 +8,8 @@
 namespace agnocast
 {
 
+struct AgnocastExecutable;
+
 // Base class for a type-erased object
 class AnyObject
 {
@@ -47,10 +49,17 @@ struct CallbackInfo
   bool need_epoll_update = true;
 };
 
+std::vector<std::string> get_agnocast_topics_by_group(
+  const rclcpp::CallbackGroup::SharedPtr & group);
+
+// Lock ordering: when acquiring both id2_callback_info_mtx and id2_timer_info_mtx,
+// always lock id2_callback_info_mtx first to avoid deadlocks.
 extern std::mutex id2_callback_info_mtx;
 extern std::unordered_map<uint32_t, CallbackInfo> id2_callback_info;
 extern std::atomic<uint32_t> next_callback_info_id;
 extern std::atomic<bool> need_epoll_updates;
+
+uint32_t allocate_callback_info_id();
 
 template <typename T, typename Func>
 TypeErasedCallback get_erased_callback(Func && callback)
@@ -76,8 +85,10 @@ uint32_t register_callback(
   // NOTE: ipc_shared_ptr<MessageT> and ipc_shared_ptr<MessageT>&& make no difference in the
   // assertion expression below, but we go with ipc_shared_ptr<MessageT>&&.
   static_assert(
-    std::is_invocable_v<std::decay_t<Func>, agnocast::ipc_shared_ptr<MessageT> &&>,
-    "Callback must be callable with ipc_shared_ptr (const&, &&, or by-value)");
+    std::is_invocable_v<std::decay_t<Func>, agnocast::ipc_shared_ptr<MessageT> &&> ||
+      std::is_invocable_v<std::decay_t<Func>, agnocast::ipc_shared_ptr<const MessageT> &&>,
+    "Callback must be callable with ipc_shared_ptr<T> or ipc_shared_ptr<const T> (const&, &&, or "
+    "by-value)");
 
   TypeErasedCallback erased_callback = get_erased_callback<MessageT>(std::forward<Func>(callback));
 
@@ -89,7 +100,7 @@ uint32_t register_callback(
       entry_id));
   };
 
-  uint32_t callback_info_id = next_callback_info_id.fetch_add(1);
+  uint32_t callback_info_id = allocate_callback_info_id();
 
   {
     std::lock_guard<std::mutex> lock(id2_callback_info_mtx);
@@ -102,5 +113,15 @@ uint32_t register_callback(
 
   return callback_info_id;
 }
+
+void receive_and_execute_message(
+  uint32_t callback_info_id, pid_t my_pid, const CallbackInfo & callback_info,
+  std::mutex & ready_agnocast_executables_mutex,
+  std::vector<AgnocastExecutable> & ready_agnocast_executables);
+
+void enqueue_receive_and_execute(
+  uint32_t callback_info_id, pid_t my_pid, const CallbackInfo & callback_info,
+  std::mutex & ready_agnocast_executables_mutex,
+  std::vector<AgnocastExecutable> & ready_agnocast_executables);
 
 }  // namespace agnocast

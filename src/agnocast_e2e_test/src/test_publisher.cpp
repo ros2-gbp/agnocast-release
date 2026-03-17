@@ -4,43 +4,70 @@
 #include "std_msgs/msg/int64.hpp"
 
 #include <chrono>
+#include <string>
 
 using namespace std::chrono_literals;
 
 class TestPublisher : public rclcpp::Node
 {
+  enum class State {
+    WaitingForConnection,      // Waiting for subscriber connections
+    WaitingForTransientLocal,  // Waiting for transient local messages (5 seconds)
+    Publishing                 // Normal publishing
+  };
+
   rclcpp::TimerBase::SharedPtr timer_;
   agnocast::Publisher<std_msgs::msg::Int64>::SharedPtr publisher_;
   int64_t count_;
   int64_t target_pub_num_;
   int64_t planned_sub_count_;
   size_t planned_pub_count_;
-  bool is_ready_ = false;
+  std::string topic_name_;
+
+  State state_ = State::WaitingForConnection;
+  rclcpp::Time connection_detected_time_;
+
   bool forever_;
 
-  bool is_ready()
+  bool check_connection_counts()
   {
-    if (is_ready_) {
-      return true;
-    }
-
+    const auto total_sub_count =
+      publisher_->get_subscription_count() + publisher_->get_intra_subscription_count();
     if (
-      publisher_->get_subscription_count() < planned_sub_count_ ||
-      this->count_publishers("/test_topic") < planned_pub_count_) {
+      total_sub_count < planned_sub_count_ ||
+      this->count_publishers(topic_name_) < planned_pub_count_) {
       return false;
     }
 
-    sleep(5);  // HACK: wait subscribing transient local messages
-    is_ready_ = true;
     return true;
   }
 
   void timer_callback()
   {
-    if (!is_ready()) {
-      return;
-    }
+    switch (state_) {
+      case State::WaitingForConnection:
+        if (check_connection_counts()) {
+          connection_detected_time_ = this->now();
+          state_ = State::WaitingForTransientLocal;
+        }
+        break;
 
+      case State::WaitingForTransientLocal:
+        // HACK: wait subscribing transient local messages
+        if ((this->now() - connection_detected_time_) >= rclcpp::Duration::from_seconds(5.0)) {
+          state_ = State::Publishing;
+          publish_message();
+        }
+        break;
+
+      case State::Publishing:
+        publish_message();
+        break;
+    }
+  }
+
+  void publish_message()
+  {
     agnocast::ipc_shared_ptr<std_msgs::msg::Int64> message = publisher_->borrow_loaned_message();
     message->data = count_;
     publisher_->publish(std::move(message));
@@ -61,6 +88,7 @@ class TestPublisher : public rclcpp::Node
 public:
   explicit TestPublisher(const rclcpp::NodeOptions & options) : Node("test_publisher", options)
   {
+    this->declare_parameter<std::string>("topic_name", "/test_topic");
     this->declare_parameter<int64_t>("qos_depth", 10);
     this->declare_parameter<bool>("transient_local", true);
     this->declare_parameter<int64_t>("init_pub_num", 10);
@@ -68,6 +96,7 @@ public:
     this->declare_parameter<int64_t>("planned_sub_count", 1);
     this->declare_parameter<int64_t>("planned_pub_count", 1);
     this->declare_parameter<bool>("forever", false);
+    topic_name_ = this->get_parameter("topic_name").as_string();
     int64_t qos_depth = this->get_parameter("qos_depth").as_int();
     bool transient_local = this->get_parameter("transient_local").as_bool();
     int64_t init_pub_num = this->get_parameter("init_pub_num").as_int();
@@ -80,7 +109,7 @@ public:
     if (transient_local) {
       qos.transient_local();
     }
-    publisher_ = agnocast::create_publisher<std_msgs::msg::Int64>(this, "/test_topic", qos);
+    publisher_ = agnocast::create_publisher<std_msgs::msg::Int64>(this, topic_name_, qos);
     count_ = 0;
     target_pub_num_ = init_pub_num + pub_num;
 
@@ -93,7 +122,7 @@ public:
       count_++;
     }
 
-    timer_ = this->create_wall_timer(10ms, std::bind(&TestPublisher::timer_callback, this));
+    timer_ = this->create_wall_timer(100ms, std::bind(&TestPublisher::timer_callback, this));
   }
 };
 
