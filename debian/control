@@ -1,0 +1,12 @@
+Source: ros-jazzy-agnocast-cie-thread-configurator
+Section: misc
+Priority: optional
+Maintainer: Takahiro Ishikawa-Aso <sykwer@gmail.com>
+Build-Depends: debhelper (>= 9.0.0), libyaml-cpp-dev, ros-jazzy-agnocast-cie-config-msgs, ros-jazzy-ament-cmake, ros-jazzy-ament-lint-auto <!nocheck>, ros-jazzy-ament-lint-common <!nocheck>, ros-jazzy-rclcpp, ros-jazzy-ros-workspace
+Homepage: 
+Standards-Version: 3.9.2
+
+Package: ros-jazzy-agnocast-cie-thread-configurator
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, libyaml-cpp-dev, ros-jazzy-agnocast-cie-config-msgs, ros-jazzy-rclcpp, ros-jazzy-ros-workspace
+Description: A dedicated node that configures the scheduling attributes of each thread in callback_isolated_executor.

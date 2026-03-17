@@ -1,0 +1,67 @@
+ros-jazzy-agnocast-cie-thread-configurator (2.3.1-1noble) noble; urgency=high
+
+
+
+ -- Takahiro Ishikawa-Aso <sykwer@gmail.com>  Mon, 16 Mar 2026 15:00:00 -0000
+
+ros-jazzy-agnocast-cie-thread-configurator (2.3.0-1noble) noble; urgency=high
+
+
+
+ -- Takahiro Ishikawa-Aso <sykwer@gmail.com>  Sun, 08 Mar 2026 15:00:00 -0000
+
+ros-jazzy-agnocast-cie-thread-configurator (2.2.0-1noble) noble; urgency=high
+
+  * fix: change package names from cie_* to agnocast_cie* (#1071 <https://github.com/tier4/agnocast/issues/1071>)
+
+ -- Takahiro Ishikawa-Aso <sykwer@gmail.com>  Wed, 18 Feb 2026 15:00:00 -0000
+
+ros-jazzy-agnocast-cie-thread-configurator (2.1.2-1noble) noble; urgency=high
+
+
+
+ -- Takahiro Ishikawa-Aso <sykwer@gmail.com>  Mon, 18 Aug 2025 15:00:00 -0000
+
+ros-jazzy-agnocast-cie-thread-configurator (2.1.1-1noble) noble; urgency=high
+
+
+
+ -- Takahiro Ishikawa-Aso <sykwer@gmail.com>  Mon, 12 May 2025 15:00:00 -0000
+
+ros-jazzy-agnocast-cie-thread-configurator (2.1.0-1noble) noble; urgency=high
+
+
+
+ -- Takahiro Ishikawa-Aso <sykwer@gmail.com>  Tue, 15 Apr 2025 15:00:00 -0000
+
+ros-jazzy-agnocast-cie-thread-configurator (2.0.1-1noble) noble; urgency=high
+
+
+
+ -- Takahiro Ishikawa-Aso <sykwer@gmail.com>  Wed, 02 Apr 2025 15:00:00 -0000
+
+ros-jazzy-agnocast-cie-thread-configurator (2.0.0-1noble) noble; urgency=high
+
+
+
+ -- Takahiro Ishikawa-Aso <sykwer@gmail.com>  Tue, 01 Apr 2025 15:00:00 -0000
+
+ros-jazzy-agnocast-cie-thread-configurator (1.0.2-1noble) noble; urgency=high
+
+
+
+ -- Takahiro Ishikawa-Aso <sykwer@gmail.com>  Thu, 13 Mar 2025 15:00:00 -0000
+
+ros-jazzy-agnocast-cie-thread-configurator (1.0.1-1noble) noble; urgency=high
+
+
+
+ -- Takahiro Ishikawa-Aso <sykwer@gmail.com>  Sun, 09 Mar 2025 15:00:00 -0000
+
+ros-jazzy-agnocast-cie-thread-configurator (1.0.0-1noble) noble; urgency=high
+
+
+
+ -- Takahiro Ishikawa-Aso <sykwer@gmail.com>  Sun, 02 Mar 2025 15:00:00 -0000
+
+
