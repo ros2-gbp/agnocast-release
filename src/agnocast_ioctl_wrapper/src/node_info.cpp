@@ -17,7 +17,11 @@ char ** get_agnocast_sub_topics(const char * node_name, int * topic_count)
 
   int fd = open("/dev/agnocast", O_RDONLY);
   if (fd < 0) {
-    perror("Failed to open /dev/agnocast");
+    if (errno == ENOENT) {
+      fprintf(stderr, "%s", AGNOCAST_DEVICE_NOT_FOUND_MSG);
+    } else {
+      perror("Failed to open /dev/agnocast");
+    }
     return nullptr;
   }
 
@@ -26,6 +30,7 @@ char ** get_agnocast_sub_topics(const char * node_name, int * topic_count)
 
   union ioctl_node_info_args node_info_args = {};
   node_info_args.topic_name_buffer_addr = reinterpret_cast<uint64_t>(agnocast_topic_buffer);
+  node_info_args.topic_name_buffer_size = MAX_TOPIC_NUM;
   node_info_args.node_name = {node_name, strlen(node_name)};
   if (ioctl(fd, AGNOCAST_GET_NODE_SUBSCRIBER_TOPICS_CMD, &node_info_args) < 0) {
     perror("AGNOCAST_TAKE_NODE_SUBSCRIBER_TOPICS_CMD failed");
@@ -77,7 +82,11 @@ char ** get_agnocast_pub_topics(const char * node_name, int * topic_count)
 
   int fd = open("/dev/agnocast", O_RDONLY);
   if (fd < 0) {
-    perror("Failed to open /dev/agnocast");
+    if (errno == ENOENT) {
+      fprintf(stderr, "%s", AGNOCAST_DEVICE_NOT_FOUND_MSG);
+    } else {
+      perror("Failed to open /dev/agnocast");
+    }
     return nullptr;
   }
 
@@ -86,6 +95,7 @@ char ** get_agnocast_pub_topics(const char * node_name, int * topic_count)
 
   union ioctl_node_info_args node_info_args = {};
   node_info_args.topic_name_buffer_addr = reinterpret_cast<uint64_t>(agnocast_topic_buffer);
+  node_info_args.topic_name_buffer_size = MAX_TOPIC_NUM;
   node_info_args.node_name = {node_name, strlen(node_name)};
   if (ioctl(fd, AGNOCAST_GET_NODE_PUBLISHER_TOPICS_CMD, &node_info_args) < 0) {
     perror("AGNOCAST_TAKE_NODE_PUBLISHER_TOPICS_CMD failed");
