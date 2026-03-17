@@ -22,8 +22,30 @@
 # pragma warning(disable: 4100)
 #endif
 
-void TRACEPOINT(
-  agnocast_publisher_init,
+// In Jazzy, TRACEPOINT macro is for calling tracepoints, not defining function names.
+// We need to define the functions explicitly with ros_trace_ prefix.
+
+void ros_trace_agnocast_init(
+  const void * context_handle)
+{
+  CONDITIONAL_TP(
+    agnocast_init,
+    context_handle);
+}
+
+void ros_trace_agnocast_node_init(
+  const void * node_handle,
+  const char * node_name,
+  const char * namespace_arg)
+{
+  CONDITIONAL_TP(
+    agnocast_node_init,
+    node_handle,
+    node_name,
+    namespace_arg);
+}
+
+void ros_trace_agnocast_publisher_init(
   const void * publisher_handle,
   const void * node_handle,
   const char * topic_name,
@@ -37,8 +59,7 @@ void TRACEPOINT(
     queue_depth);
 }
 
-void TRACEPOINT(
-  agnocast_subscription_init,
+void ros_trace_agnocast_subscription_init(
   const void * subscription_handle,
   const void * node_handle,
   const void * callback,
@@ -46,7 +67,7 @@ void TRACEPOINT(
   const char * function_symbol,
   const char * topic_name,
   const size_t queue_depth,
-  const uint64_t pid_ciid)
+  const uint64_t pid_callback_info_id)
 {
   CONDITIONAL_TP(
     agnocast_subscription_init,
@@ -57,39 +78,74 @@ void TRACEPOINT(
     function_symbol,
     topic_name,
     queue_depth,
-    pid_ciid);
+    pid_callback_info_id);
 }
 
-void TRACEPOINT(
-  agnocast_publish,
+void ros_trace_agnocast_timer_init(
+  const void * timer_handle,
+  const void * node_handle,
+  const void * callback,
+  const void * callback_group,
+  const char * function_symbol,
+  int64_t period)
+{
+  CONDITIONAL_TP(
+    agnocast_timer_init,
+    timer_handle,
+    node_handle,
+    callback,
+    callback_group,
+    function_symbol,
+    period);
+}
+
+void ros_trace_agnocast_add_callback_group(
+  const void * executor_addr,
+  const void * node_handle,
+  const void * callback_group_addr,
+  const char * group_type_name)
+{
+  CONDITIONAL_TP(
+    agnocast_add_callback_group,
+    executor_addr,
+    node_handle,
+    callback_group_addr,
+    group_type_name);
+}
+
+void ros_trace_agnocast_publish(
   const void * publisher_handle,
-  const void * message,
   const int64_t entry_id)
 {
   CONDITIONAL_TP(
     agnocast_publish,
     publisher_handle,
-    message,
     entry_id);
 }
 
-void TRACEPOINT(
-  agnocast_create_callable,
+void ros_trace_agnocast_create_callable(
   const void * callable,
-  const void * message,
   const int64_t entry_id,
-  const uint64_t pid_ciid)
+  const uint64_t pid_callback_info_id)
 {
   CONDITIONAL_TP(
     agnocast_create_callable,
     callable,
-    message,
     entry_id,
-    pid_ciid);
+    pid_callback_info_id);
 }
 
-void TRACEPOINT(
-  agnocast_callable_start,
+void ros_trace_agnocast_create_timer_callable(
+  const void * callable,
+  const void * timer_handle)
+{
+  CONDITIONAL_TP(
+    agnocast_create_timer_callable,
+    callable,
+    timer_handle);
+}
+
+void ros_trace_agnocast_callable_start(
   const void * callable)
 {
   CONDITIONAL_TP(
@@ -97,8 +153,7 @@ void TRACEPOINT(
     callable);
 }
 
-void TRACEPOINT(
-  agnocast_callable_end,
+void ros_trace_agnocast_callable_end(
   const void * callable)
 {
   CONDITIONAL_TP(
@@ -106,8 +161,7 @@ void TRACEPOINT(
     callable);
 }
 
-void TRACEPOINT(
-  agnocast_take,
+void ros_trace_agnocast_take(
   const void * subscription_handle,
   const void * message,
   const int64_t entry_id)
@@ -119,8 +173,7 @@ void TRACEPOINT(
     entry_id);
 }
 
-void TRACEPOINT(
-  agnocast_construct_executor,
+void ros_trace_agnocast_construct_executor(
   const void * executor_addr,
   const char * executor_type_name)
 {
