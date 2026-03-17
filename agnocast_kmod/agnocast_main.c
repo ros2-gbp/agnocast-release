@@ -2,11 +2,14 @@
 #include "agnocast_memory_allocator.h"
 
 #include <linux/device.h>
+#include <linux/fs.h>
 #include <linux/hashtable.h>
 #include <linux/kernel.h>
-#include <linux/kprobes.h>
 #include <linux/kthread.h>
+#include <linux/mm.h>  // kvzalloc, kvfree
+#include <linux/rwsem.h>
 #include <linux/slab.h>  // kmalloc, kfree
+#include <linux/tracepoint.h>
 #include <linux/version.h>
 
 MODULE_LICENSE("Dual BSD/GPL");
@@ -14,7 +17,22 @@ MODULE_LICENSE("Dual BSD/GPL");
 static int major;
 static struct class * agnocast_class;
 static struct device * agnocast_device;
-static DEFINE_MUTEX(global_mutex);
+
+// Locking convention:
+//   Only ioctl_ prefixed functions acquire locks. All other internal/static functions are
+//   lock-free and rely on callers to hold the appropriate locks. Exceptions are
+//   agnocast_process_exit_cleanup, agnocast_exit_free_data, and increment_message_entry_rc, which
+//   manage locks directly.
+//
+// Lock ordering (to prevent deadlocks, always acquire in this order):
+//   1. global_htables_rwsem   (this file)
+//   2. topic_rwsem            (per-topic, in struct topic_wrapper)
+//   3. mempool_lock           (agnocast_memory_allocator.c)
+//
+// Global rwsem for hashtables (topic_hashtable, proc_info_htable, bridge_htable)
+// - Read lock (down_read): when searching hashtables and operating within a topic
+// - Write lock (down_write): when adding/removing entries from hashtables
+static DECLARE_RWSEM(global_htables_rwsem);
 
 #ifndef VERSION
 #define VERSION "unknown"
@@ -29,24 +47,31 @@ static DEFINE_MUTEX(global_mutex);
 #define SUB_INFO_HASH_BITS 5
 #define PROC_INFO_HASH_BITS 10
 
-// Maximum number of referencing Publisher/Subscriber per entry: +1 for the publisher
-#define MAX_REFERENCING_PUBSUB_NUM_PER_ENTRY (MAX_SUBSCRIBER_NUM + 1)
-
-// Maximum length of topic name: 256 characters
-#define TOPIC_NAME_BUFFER_SIZE 256
-
-// Maximum number of topic info ret
-#define MAX_TOPIC_INFO_RET_NUM max(MAX_PUBLISHER_NUM, MAX_SUBSCRIBER_NUM)
+// Allocated in pre_handler_subscriber_exit(), freed in agnocast_commit_exit_process() after
+// the daemon successfully copies the data to user-space.
+struct exit_subscription_entry
+{
+  char topic_name[TOPIC_NAME_BUFFER_SIZE];
+  topic_local_id_t subscriber_id;
+  struct list_head list;
+};
 
 struct process_info
 {
   bool exited;
+  // Used to track whether this process is an alive Performance Bridge Manager.
+  // Standard Bridge Manager also updates this flag for consistency, but the flag
+  // is not used for Standard Bridge spawn decisions (Standard bridges are spawned
+  // per-process, not per-IPC-namespace).
+  bool is_performance_bridge_manager;
   pid_t global_pid;
   pid_t local_pid;
-  uint64_t shm_size;
   struct mempool_entry * mempool_entry;
   const struct ipc_namespace * ipc_ns;
+  struct list_head exit_subscription_list;
+  uint32_t exit_subscription_count;
   struct hlist_node node;
+  struct rcu_head rcu_head;
 };
 
 DEFINE_HASHTABLE(proc_info_htable, PROC_INFO_HASH_BITS);
@@ -59,6 +84,7 @@ struct publisher_info
   uint32_t qos_depth;
   bool qos_is_transient_local;
   uint32_t entries_num;
+  bool is_bridge;
   struct hlist_node node;
 };
 
@@ -68,10 +94,13 @@ struct subscriber_info
   pid_t pid;
   uint32_t qos_depth;
   bool qos_is_transient_local;
+  bool qos_is_reliable;
   int64_t latest_received_entry_id;
   char * node_name;
   bool is_take_sub;
+  bool ignore_local_publications;
   bool need_mmap_update;
+  bool is_bridge;
   struct hlist_node node;
 };
 
@@ -82,6 +111,8 @@ struct topic_struct
   DECLARE_HASHTABLE(sub_info_htable, SUB_INFO_HASH_BITS);
   topic_local_id_t current_pubsub_id;
   int64_t current_entry_id;
+  uint32_t ros2_subscriber_num;  // Updated by Bridge Manager
+  uint32_t ros2_publisher_num;   // Updated by Bridge Manager
 };
 
 struct topic_wrapper
@@ -89,6 +120,8 @@ struct topic_wrapper
   const struct ipc_namespace *
     ipc_ns;  // For use in separating topic namespaces when using containers.
   char * key;
+  struct rw_semaphore
+    topic_rwsem;  // Per-topic rwsem: read for read-only ops, write for publish/receive/modify
   struct topic_struct topic;
   struct hlist_node node;
 };
@@ -99,11 +132,24 @@ struct entry_node
   int64_t entry_id;  // rbtree key
   topic_local_id_t publisher_id;
   uint64_t msg_virtual_address;
-  topic_local_id_t referencing_ids[MAX_REFERENCING_PUBSUB_NUM_PER_ENTRY];
-  uint8_t reference_count[MAX_REFERENCING_PUBSUB_NUM_PER_ENTRY];
+  // Per-subscriber boolean flag: if bit is set, subscriber is holding a reference.
+  // When subscriber releases the reference, the bit is cleared.
+  DECLARE_BITMAP(referencing_subscribers, MAX_TOPIC_LOCAL_ID);
 };
 
 DEFINE_HASHTABLE(topic_hashtable, TOPIC_HASH_BITS);
+
+struct bridge_info
+{
+  char * topic_name;
+  pid_t pid;
+  bool has_r2a;  // ROS2 -> Agnocast
+  bool has_a2r;  // Agnocast -> ROS2
+  const struct ipc_namespace * ipc_ns;
+  struct hlist_node node;
+};
+
+static DEFINE_HASHTABLE(bridge_htable, TOPIC_HASH_BITS);
 
 #ifndef KUNIT_BUILD
 // Kernel module uses global PIDs, whereas user-space and the interface between them use local PIDs.
@@ -180,14 +226,17 @@ static int add_topic(
     return -ENOMEM;
   }
 
+  init_rwsem(&(*wrapper)->topic_rwsem);
   (*wrapper)->topic.entries = RB_ROOT;
   hash_init((*wrapper)->topic.pub_info_htable);
   hash_init((*wrapper)->topic.sub_info_htable);
   (*wrapper)->topic.current_pubsub_id = 0;
   (*wrapper)->topic.current_entry_id = 0;
+  (*wrapper)->topic.ros2_subscriber_num = 0;
+  (*wrapper)->topic.ros2_publisher_num = 0;
   hash_add(topic_hashtable, &(*wrapper)->node, get_topic_hash(topic_name));
 
-  dev_info(agnocast_device, "Topic (topic_name=%s) added. (add_topic)\n", topic_name);
+  dev_dbg(agnocast_device, "Topic (topic_name=%s) added. (add_topic)\n", topic_name);
 
   return 0;
 }
@@ -221,18 +270,10 @@ static struct subscriber_info * find_subscriber_info(
 
 static int insert_subscriber_info(
   struct topic_wrapper * wrapper, const char * node_name, const pid_t subscriber_pid,
-  const uint32_t qos_depth, const bool qos_is_transient_local, const bool is_take_sub,
+  const uint32_t qos_depth, const bool qos_is_transient_local, const bool qos_is_reliable,
+  const bool is_take_sub, bool ignore_local_publications, const bool is_bridge,
   struct subscriber_info ** new_info)
 {
-  if (qos_depth > MAX_QOS_DEPTH) {
-    dev_warn(
-      agnocast_device,
-      "Subscriber's (topic_local_id=%s, pid=%d, qos_depth=%d) qos_depth can't be larger than "
-      "MAX_QOS_DEPTH(=%d). (insert_subscriber_info)\n",
-      wrapper->key, subscriber_pid, qos_depth, MAX_QOS_DEPTH);
-    return -EINVAL;
-  }
-
   int count = get_size_sub_info_htable(wrapper);
   if (count == MAX_SUBSCRIBER_NUM) {
     dev_warn(
@@ -242,6 +283,16 @@ static int insert_subscriber_info(
       "added. (insert_subscriber_info)\n",
       wrapper->key, MAX_SUBSCRIBER_NUM);
     return -ENOBUFS;
+  }
+
+  if (wrapper->topic.current_pubsub_id >= MAX_TOPIC_LOCAL_ID) {
+    dev_warn(
+      agnocast_device,
+      "current_pubsub_id (%d) for the topic (topic_name=%s) reached the upper "
+      "bound (MAX_TOPIC_LOCAL_ID=%d), so no new subscriber can be "
+      "added. (insert_subscriber_info)\n",
+      wrapper->topic.current_pubsub_id, wrapper->key, MAX_TOPIC_LOCAL_ID);
+    return -ENOSPC;
   }
 
   *new_info = kmalloc(sizeof(struct subscriber_info), GFP_KERNEL);
@@ -264,6 +315,7 @@ static int insert_subscriber_info(
   (*new_info)->pid = subscriber_pid;
   (*new_info)->qos_depth = qos_depth;
   (*new_info)->qos_is_transient_local = qos_is_transient_local;
+  (*new_info)->qos_is_reliable = qos_is_reliable;
   if (qos_is_transient_local) {
     (*new_info)->latest_received_entry_id = -1;
   } else {
@@ -271,16 +323,18 @@ static int insert_subscriber_info(
   }
   (*new_info)->node_name = node_name_copy;
   (*new_info)->is_take_sub = is_take_sub;
+  (*new_info)->ignore_local_publications = ignore_local_publications;
   (*new_info)->need_mmap_update = true;
+  (*new_info)->is_bridge = is_bridge;
   INIT_HLIST_NODE(&(*new_info)->node);
   uint32_t hash_val = hash_min(new_id, SUB_INFO_HASH_BITS);
   hash_add(wrapper->topic.sub_info_htable, &(*new_info)->node, hash_val);
 
   dev_info(
     agnocast_device,
-    "Subscriber (topic_local_id=%d, pid=%d) is added to the topic (topic_name=%s). "
+    "Subscriber (topic_local_id=%d, pid=%d, node_name=%s) is added to the topic (topic_name=%s). "
     "(insert_subscriber_info)\n",
-    new_id, subscriber_pid, wrapper->key);
+    new_id, subscriber_pid, node_name, wrapper->key);
 
   // Check if the topic has any volatile publishers.
   if (qos_is_transient_local) {
@@ -331,7 +385,8 @@ static struct publisher_info * find_publisher_info(
 
 static int insert_publisher_info(
   struct topic_wrapper * wrapper, const char * node_name, const pid_t publisher_pid,
-  const uint32_t qos_depth, const bool qos_is_transient_local, struct publisher_info ** new_info)
+  const uint32_t qos_depth, const bool qos_is_transient_local, const bool is_bridge,
+  struct publisher_info ** new_info)
 {
   int count = get_size_pub_info_htable(wrapper);
   if (count == MAX_PUBLISHER_NUM) {
@@ -342,6 +397,16 @@ static int insert_publisher_info(
       "added. (insert_publisher_info)\n",
       wrapper->key, MAX_PUBLISHER_NUM);
     return -ENOBUFS;
+  }
+
+  if (wrapper->topic.current_pubsub_id >= MAX_TOPIC_LOCAL_ID) {
+    dev_warn(
+      agnocast_device,
+      "current_pubsub_id (%d) for the topic (topic_name=%s) reached the upper "
+      "bound (MAX_TOPIC_LOCAL_ID=%d), so no new publisher can be "
+      "added. (insert_publisher_info)\n",
+      wrapper->topic.current_pubsub_id, wrapper->key, MAX_TOPIC_LOCAL_ID);
+    return -ENOSPC;
   }
 
   *new_info = kmalloc(sizeof(struct publisher_info), GFP_KERNEL);
@@ -366,15 +431,16 @@ static int insert_publisher_info(
   (*new_info)->qos_depth = qos_depth;
   (*new_info)->qos_is_transient_local = qos_is_transient_local;
   (*new_info)->entries_num = 0;
+  (*new_info)->is_bridge = is_bridge;
   INIT_HLIST_NODE(&(*new_info)->node);
   uint32_t hash_val = hash_min(new_id, PUB_INFO_HASH_BITS);
   hash_add(wrapper->topic.pub_info_htable, &(*new_info)->node, hash_val);
 
   dev_info(
     agnocast_device,
-    "Publisher (topic_local_id=%d, pid=%d) is added to the topic (topic_name=%s). "
+    "Publisher (topic_local_id=%d, pid=%d, node_name=%s) is added to the topic (topic_name=%s). "
     "(insert_publisher_info)\n",
-    new_id, publisher_pid, wrapper->key);
+    new_id, publisher_pid, node_name, wrapper->key);
 
   // Check if the topic has any transient local subscribers.
   if (!qos_is_transient_local) {
@@ -398,46 +464,30 @@ static int insert_publisher_info(
 
 static bool is_referenced(struct entry_node * en)
 {
-  // The referencing_ids array is always populated starting from the smallest index.
-  // Therefore, the value -1 at index 0 is equivalent to a non-existent referencing.
-  return (en->referencing_ids[0] != -1);
+  return !bitmap_empty(en->referencing_subscribers, MAX_TOPIC_LOCAL_ID);
 }
 
-static void remove_reference_by_index(struct entry_node * en, int index)
+// Add subscriber reference to entry (set boolean flag to true).
+// Called when subscriber first receives/takes the message.
+static int add_subscriber_reference(struct entry_node * en, const topic_local_id_t id)
 {
-  for (int i = index; i < MAX_REFERENCING_PUBSUB_NUM_PER_ENTRY - 1; i++) {
-    en->referencing_ids[i] = en->referencing_ids[i + 1];
-    en->reference_count[i] = en->reference_count[i + 1];
+  if (id < 0 || id >= MAX_TOPIC_LOCAL_ID) {
+    pr_err(
+      "subscriber id %d out of range [0, %d). (add_subscriber_reference)\n", id,
+      MAX_TOPIC_LOCAL_ID);
+    return -EINVAL;
   }
 
-  en->referencing_ids[MAX_REFERENCING_PUBSUB_NUM_PER_ENTRY - 1] = -1;
-  en->reference_count[MAX_REFERENCING_PUBSUB_NUM_PER_ENTRY - 1] = 0;
-  return;
-}
-
-static int increment_sub_rc(struct entry_node * en, const topic_local_id_t id)
-{
-  for (int i = 0; i < MAX_REFERENCING_PUBSUB_NUM_PER_ENTRY; i++) {
-    if (en->referencing_ids[i] == id) {
-      en->reference_count[i]++;
-      return 0;
-    }
-
-    if (en->reference_count[i] == 0) {
-      en->referencing_ids[i] = id;
-      en->reference_count[i] = 1;
-      return 0;
-    }
+  // Already referenced by this subscriber - unexpected
+  if (test_and_set_bit(id, en->referencing_subscribers)) {
+    dev_warn(
+      agnocast_device,
+      "subscriber id=%d already holds a reference for entry_id=%lld. "
+      "(add_subscriber_reference)\n",
+      id, en->entry_id);
+    return -EALREADY;
   }
-
-  dev_warn(
-    agnocast_device,
-    "Unreachable. The number of referencing publisher and subscribers reached the upper bound "
-    "(MAX_REFERENCING_PUBSUB_NUM_PER_ENTRY=%d), so no new subscriber can reference. "
-    "(increment_sub_rc)\n",
-    MAX_REFERENCING_PUBSUB_NUM_PER_ENTRY);
-
-  return -ENOBUFS;
+  return 0;
 }
 
 static struct entry_node * find_message_entry(
@@ -461,17 +511,26 @@ static struct entry_node * find_message_entry(
   return NULL;
 }
 
-int increment_message_entry_rc(
+// Add subscriber reference to message entry (set boolean flag to true).
+// Called when subscriber first receives/takes the message.
+int agnocast_increment_message_entry_rc(
   const char * topic_name, const struct ipc_namespace * ipc_ns, const topic_local_id_t pubsub_id,
   const int64_t entry_id)
 {
+  int ret = 0;
+
+  down_read(&global_htables_rwsem);
+
   struct topic_wrapper * wrapper = find_topic(topic_name, ipc_ns);
   if (!wrapper) {
     dev_warn(
       agnocast_device, "Topic (topic_name=%s) not found. (increment_message_entry_rc)\n",
       topic_name);
-    return -EINVAL;
+    ret = -EINVAL;
+    goto unlock_only_global;
   }
+
+  down_read(&wrapper->topic_rwsem);
 
   struct entry_node * en = find_message_entry(wrapper, entry_id);
   if (!en) {
@@ -480,67 +539,91 @@ int increment_message_entry_rc(
       "Message entry (topic_name=%s entry_id=%lld) not found. "
       "(increment_message_entry_rc)\n",
       topic_name, entry_id);
-    return -EINVAL;
+    ret = -EINVAL;
+    goto unlock_all;
   }
 
-  // Incrementing reference count is allowed only for subscribers
+  // Adding reference is allowed only for subscribers
   if (!find_subscriber_info(wrapper, pubsub_id)) {
     dev_warn(
       agnocast_device,
       "Subscriber (id=%d) not found in the topic (topic_name=%s). (increment_message_entry_rc)\n",
       pubsub_id, wrapper->key);
-    return -EINVAL;
+    ret = -EINVAL;
+    goto unlock_all;
   }
 
-  int ret = increment_sub_rc(en, pubsub_id);
+  ret = add_subscriber_reference(en, pubsub_id);
   if (ret < 0) {
-    return ret;
+    goto unlock_all;
   }
 
-  return 0;
+unlock_all:
+  up_read(&wrapper->topic_rwsem);
+unlock_only_global:
+  up_read(&global_htables_rwsem);
+  return ret;
 }
 
-int decrement_message_entry_rc(
+// Forward declaration
+static int get_process_num(const struct ipc_namespace * ipc_ns);
+
+// Release subscriber reference from message entry (set boolean flag to false).
+// Called when subscriber's last ipc_shared_ptr reference is destroyed.
+int agnocast_ioctl_release_message_entry_reference(
   const char * topic_name, const struct ipc_namespace * ipc_ns, const topic_local_id_t pubsub_id,
   const int64_t entry_id)
 {
+  int ret = 0;
+
+  down_read(&global_htables_rwsem);
+
   struct topic_wrapper * wrapper = find_topic(topic_name, ipc_ns);
   if (!wrapper) {
     dev_warn(
-      agnocast_device, "Topic (topic_name=%s) not found. (decrement_message_entry_rc)\n",
+      agnocast_device, "Topic (topic_name=%s) not found. (ioctl_release_message_entry_reference)\n",
       topic_name);
-    return -EINVAL;
+    ret = -EINVAL;
+    goto unlock_only_global;
   }
+
+  down_read(&wrapper->topic_rwsem);
 
   struct entry_node * en = find_message_entry(wrapper, entry_id);
   if (!en) {
     dev_warn(
       agnocast_device,
       "Message entry (topic_name=%s entry_id=%lld) not found. "
-      "(decrement_message_entry_rc)\n",
+      "(ioctl_release_message_entry_reference)\n",
       topic_name, entry_id);
-    return -EINVAL;
+    ret = -EINVAL;
+    goto unlock_all;
   }
 
-  // decrement reference_count
-  for (int i = 0; i < MAX_REFERENCING_PUBSUB_NUM_PER_ENTRY; i++) {
-    if (en->referencing_ids[i] == pubsub_id) {
-      en->reference_count[i]--;
-      if (en->reference_count[i] == 0) {
-        remove_reference_by_index(en, i);
-      }
-
-      return 0;
-    }
+  if (pubsub_id < 0 || pubsub_id >= MAX_TOPIC_LOCAL_ID) {
+    dev_warn(
+      agnocast_device,
+      "pubsub_id %d out of range [0, %d). (ioctl_release_message_entry_reference)\n", pubsub_id,
+      MAX_TOPIC_LOCAL_ID);
+    ret = -EINVAL;
+    goto unlock_all;
   }
 
-  dev_warn(
-    agnocast_device,
-    "Try to decrement reference of Publisher/Subscriber (pubsub_id=%d) for message entry "
-    "(topic_name=%s entry_id=%lld), but it is not found. (decrement_message_entry_rc)\n",
-    pubsub_id, topic_name, entry_id);
+  if (!test_and_clear_bit(pubsub_id, en->referencing_subscribers)) {
+    dev_warn(
+      agnocast_device,
+      "pubsub_id %d does not hold a reference for entry (topic_name=%s entry_id=%lld). "
+      "(ioctl_release_message_entry_reference)\n",
+      pubsub_id, topic_name, entry_id);
+    ret = -EINVAL;
+    goto unlock_all;
+  }
 
-  return -EINVAL;
+unlock_all:
+  up_read(&wrapper->topic_rwsem);
+unlock_only_global:
+  up_read(&global_htables_rwsem);
+  return ret;
 }
 
 static int insert_message_entry(
@@ -556,12 +639,9 @@ static int insert_message_entry(
   new_node->entry_id = wrapper->topic.current_entry_id++;
   new_node->publisher_id = pub_info->id;
   new_node->msg_virtual_address = msg_virtual_address;
-  new_node->referencing_ids[0] = pub_info->id;
-  new_node->reference_count[0] = 1;
-  for (int i = 1; i < MAX_REFERENCING_PUBSUB_NUM_PER_ENTRY; i++) {
-    new_node->referencing_ids[i] = -1;
-    new_node->reference_count[i] = 0;
-  }
+  // Publisher-side handles do not participate in reference counting.
+  // Subscribers will add their references when they receive/take the message.
+  bitmap_zero(new_node->referencing_subscribers, MAX_TOPIC_LOCAL_ID);
 
   struct rb_root * root = &wrapper->topic.entries;
   struct rb_node ** new = &(root->rb_node);
@@ -616,7 +696,8 @@ static struct process_info * find_process_info(const pid_t pid)
 
 static int set_publisher_shm_info(
   const struct topic_wrapper * wrapper, const pid_t subscriber_pid,
-  struct publisher_shm_info * pub_shm_info)
+  struct publisher_shm_info * pub_shm_infos, uint32_t pub_shm_infos_size,
+  uint32_t * ret_pub_shm_num)
 {
   uint32_t publisher_num = 0;
   struct publisher_info * pub_info;
@@ -636,12 +717,12 @@ static int set_publisher_shm_info(
     if (ret < 0) {
       if (ret == -EEXIST) {
         continue;
-      } else if (ret == -ENOBUFS) {
+      } else if (ret == -ENOMEM) {
         dev_warn(
           agnocast_device,
-          "Process (pid=%d)'s memory pool is already full (MAX_PROCESS_NUM_PER_MEMPOOL=%d), so no "
-          "new mapping from pid=%d can be created. (set_publisher_shm_info)\n",
-          pub_info->pid, MAX_PROCESS_NUM_PER_MEMPOOL, subscriber_pid);
+          "Failed to allocate memory for mapping from pid=%d to process (pid=%d)'s memory pool. "
+          "(set_publisher_shm_info)\n",
+          subscriber_pid, pub_info->pid);
         return ret;
       } else {
         dev_warn(
@@ -653,13 +734,12 @@ static int set_publisher_shm_info(
       }
     }
 
-    if (publisher_num == MAX_PUBLISHER_NUM) {
+    if (publisher_num == pub_shm_infos_size) {
       dev_warn(
         agnocast_device,
-        "Unreachable: the number of publisher processes to be mapped exceeds the maximum number "
-        "that can be returned at once in a call from this subscriber process (topic_name=%s, "
-        "subscriber_pid=%d). (set_publisher_shm_info)\n",
-        wrapper->key, subscriber_pid);
+        "The number of publisher processes to be mapped exceeds the buffer size "
+        "(pub_shm_infos_size=%u, topic_name=%s, subscriber_pid=%d). (set_publisher_shm_info)\n",
+        pub_shm_infos_size, wrapper->key, subscriber_pid);
       return -ENOBUFS;
     }
 
@@ -668,136 +748,155 @@ static int set_publisher_shm_info(
     if (local_pid == -1) {
       return -ESRCH;
     }
-    pub_shm_info->publisher_pids[publisher_num] = local_pid;
+    pub_shm_infos[publisher_num].pid = local_pid;
 #else
-    pub_shm_info->publisher_pids[publisher_num] = pub_info->pid;
+    pub_shm_infos[publisher_num].pid = pub_info->pid;
 #endif
 
-    pub_shm_info->shm_addrs[publisher_num] = proc_info->mempool_entry->addr;
-    pub_shm_info->shm_sizes[publisher_num] = proc_info->shm_size;
+    pub_shm_infos[publisher_num].shm_addr = proc_info->mempool_entry->addr;
+    pub_shm_infos[publisher_num].shm_size = mempool_size_bytes;
     publisher_num++;
   }
 
-  pub_shm_info->publisher_num = publisher_num;
+  *ret_pub_shm_num = publisher_num;
 
   return 0;
 }
 
-static int get_version(struct ioctl_get_version_args * ioctl_ret)
+int agnocast_ioctl_get_version(struct ioctl_get_version_args * ioctl_ret)
 {
-  memcpy(ioctl_ret->ret_version, VERSION, strlen(VERSION) + 1);
+  strscpy(ioctl_ret->ret_version, VERSION, VERSION_BUFFER_LEN);
 
   return 0;
 }
 
-static bool check_daemon_necessity(const struct ipc_namespace * ipc_ns)
+static bool has_alive_performance_bridge_manager(const struct ipc_namespace * ipc_ns)
 {
   struct process_info * proc_info;
   int bkt;
   hash_for_each(proc_info_htable, bkt, proc_info, node)
   {
-    if (ipc_eq(ipc_ns, proc_info->ipc_ns)) {
+    if (
+      ipc_eq(ipc_ns, proc_info->ipc_ns) && proc_info->is_performance_bridge_manager &&
+      !proc_info->exited) {
       return true;
     }
   }
-
   return false;
 }
 
-int add_process(
-  const pid_t pid, const struct ipc_namespace * ipc_ns, uint64_t shm_size,
+int agnocast_ioctl_add_process(
+  const pid_t pid, const struct ipc_namespace * ipc_ns, const bool is_performance_bridge_manager,
   union ioctl_add_process_args * ioctl_ret)
 {
-  if (shm_size % PAGE_SIZE != 0) {
-    dev_warn(
-      agnocast_device, "shm_size=%llu is not aligned to PAGE_SIZE=%lu. (add_process)\n", shm_size,
-      PAGE_SIZE);
-    return -EINVAL;
-  }
+  int ret = 0;
+
+  down_write(&global_htables_rwsem);
 
   if (find_process_info(pid)) {
-    dev_warn(agnocast_device, "Process (pid=%d) already exists. (add_process)\n", pid);
-    return -EINVAL;
+    dev_warn(
+      agnocast_device, "Process (pid=%d) already exists. (agnocast_ioctl_add_process)\n", pid);
+    ret = -EINVAL;
+    goto unlock;
   }
-  ioctl_ret->ret_unlink_daemon_exist = check_daemon_necessity(ipc_ns);
+  ioctl_ret->ret_unlink_daemon_exist = (get_process_num(ipc_ns) > 0);
+  ioctl_ret->ret_performance_bridge_daemon_exist = has_alive_performance_bridge_manager(ipc_ns);
+
+  if (is_performance_bridge_manager && ioctl_ret->ret_performance_bridge_daemon_exist) {
+    goto unlock;
+  }
 
   struct process_info * new_proc_info = kmalloc(sizeof(struct process_info), GFP_KERNEL);
   if (!new_proc_info) {
-    dev_warn(agnocast_device, "kmalloc failed. (add_process)\n");
-    return -ENOMEM;
+    dev_warn(agnocast_device, "kmalloc failed. (ioctl_add_process)\n");
+    ret = -ENOMEM;
+    goto unlock;
   }
 
   new_proc_info->exited = false;
+  new_proc_info->is_performance_bridge_manager = is_performance_bridge_manager;
+  INIT_LIST_HEAD(&new_proc_info->exit_subscription_list);
+  new_proc_info->exit_subscription_count = 0;
   new_proc_info->global_pid = pid;
 #ifndef KUNIT_BUILD
   new_proc_info->local_pid = convert_pid_to_local(pid);
 #else
   new_proc_info->local_pid = pid;
 #endif
-  new_proc_info->shm_size = shm_size;
-
-  new_proc_info->mempool_entry = assign_memory(pid, shm_size);
+  new_proc_info->mempool_entry = assign_memory(pid);
   if (!new_proc_info->mempool_entry) {
     dev_warn(
-      agnocast_device,
-      "Process (pid=%d) failed to allocate memory (shm_size=%llu). (add_process)\n", pid, shm_size);
+      agnocast_device, "Process (pid=%d) failed to allocate memory. (ioctl_add_process)\n", pid);
     kfree(new_proc_info);
-    return -ENOMEM;
+    ret = -ENOMEM;
+    goto unlock;
   }
 
   new_proc_info->ipc_ns = ipc_ns;
 
   INIT_HLIST_NODE(&new_proc_info->node);
   uint32_t hash_val = hash_min(new_proc_info->global_pid, PROC_INFO_HASH_BITS);
-  hash_add(proc_info_htable, &new_proc_info->node, hash_val);
+  hash_add_rcu(proc_info_htable, &new_proc_info->node, hash_val);
 
   ioctl_ret->ret_addr = new_proc_info->mempool_entry->addr;
-  return 0;
+  ioctl_ret->ret_shm_size = mempool_size_bytes;
+
+unlock:
+  up_write(&global_htables_rwsem);
+  return ret;
 }
 
-int add_subscriber(
+int agnocast_ioctl_add_subscriber(
   const char * topic_name, const struct ipc_namespace * ipc_ns, const char * node_name,
   const pid_t subscriber_pid, const uint32_t qos_depth, const bool qos_is_transient_local,
-  const bool is_take_sub, union ioctl_add_subscriber_args * ioctl_ret)
+  const bool qos_is_reliable, const bool is_take_sub, const bool ignore_local_publications,
+  const bool is_bridge, union ioctl_add_subscriber_args * ioctl_ret)
 {
   int ret;
+
+  down_write(&global_htables_rwsem);
 
   struct topic_wrapper * wrapper;
   ret = add_topic(topic_name, ipc_ns, &wrapper);
   if (ret < 0) {
-    return ret;
+    goto unlock;
   }
 
   struct subscriber_info * sub_info;
   ret = insert_subscriber_info(
-    wrapper, node_name, subscriber_pid, qos_depth, qos_is_transient_local, is_take_sub, &sub_info);
+    wrapper, node_name, subscriber_pid, qos_depth, qos_is_transient_local, qos_is_reliable,
+    is_take_sub, ignore_local_publications, is_bridge, &sub_info);
   if (ret < 0) {
-    return ret;
+    goto unlock;
   }
 
   ioctl_ret->ret_id = sub_info->id;
 
-  return 0;
+unlock:
+  up_write(&global_htables_rwsem);
+  return ret;
 }
 
-int add_publisher(
+int agnocast_ioctl_add_publisher(
   const char * topic_name, const struct ipc_namespace * ipc_ns, const char * node_name,
   const pid_t publisher_pid, const uint32_t qos_depth, const bool qos_is_transient_local,
-  union ioctl_add_publisher_args * ioctl_ret)
+  const bool is_bridge, union ioctl_add_publisher_args * ioctl_ret)
 {
   int ret;
+
+  down_write(&global_htables_rwsem);
 
   struct topic_wrapper * wrapper;
   ret = add_topic(topic_name, ipc_ns, &wrapper);
   if (ret < 0) {
-    return ret;
+    goto unlock;
   }
 
   struct publisher_info * pub_info;
   ret = insert_publisher_info(
-    wrapper, node_name, publisher_pid, qos_depth, qos_is_transient_local, &pub_info);
+    wrapper, node_name, publisher_pid, qos_depth, qos_is_transient_local, is_bridge, &pub_info);
   if (ret < 0) {
-    return ret;
+    goto unlock;
   }
 
   ioctl_ret->ret_id = pub_info->id;
@@ -810,7 +909,9 @@ int add_publisher(
     sub_info->need_mmap_update = true;
   }
 
-  return 0;
+unlock:
+  up_write(&global_htables_rwsem);
+  return ret;
 }
 
 static int release_msgs_to_meet_depth(
@@ -856,10 +957,9 @@ static int release_msgs_to_meet_depth(
   // HACK:
   //   The current implementation only releases a maximum of MAX_RELEASE_NUM messages at a time, and
   //   if there are more messages to release, qos_depth is temporarily not met.
-  //   However, it is rare for the reference_count of more than MAX_RELEASE_NUM messages
-  //   that are out of qos_depth to be zero at a specific time. If this happens, as long as the
-  //   publisher's qos_depth is greater than the subscriber's qos_depth, this has little effect on
-  //   system behavior.
+  //   However, it is rare for more than MAX_RELEASE_NUM messages that are out of qos_depth to be
+  //   unreferenced at a specific time. If this happens, as long as the publisher's qos_depth is
+  //   greater than the subscriber's qos_depth, this has little effect on system behavior.
   while (num_search_entries > 0 && ioctl_ret->ret_released_num < MAX_RELEASE_NUM) {
     struct entry_node * en = container_of(node, struct entry_node, node);
     node = rb_next(node);
@@ -896,90 +996,137 @@ static int release_msgs_to_meet_depth(
   return 0;
 }
 
-int publish_msg(
+int agnocast_ioctl_publish_msg(
   const char * topic_name, const struct ipc_namespace * ipc_ns, const topic_local_id_t publisher_id,
-  const uint64_t msg_virtual_address, union ioctl_publish_msg_args * ioctl_ret)
+  const uint64_t msg_virtual_address, topic_local_id_t * subscriber_ids_out,
+  uint32_t subscriber_ids_buffer_size, union ioctl_publish_msg_args * ioctl_ret)
 {
-  struct topic_wrapper * wrapper = find_topic(topic_name, ipc_ns);
-  if (!wrapper) {
-    dev_warn(agnocast_device, "Topic (topic_name=%s) not found. (publish_msg)\n", topic_name);
+  int ret = 0;
+
+  if (subscriber_ids_buffer_size != MAX_SUBSCRIBER_NUM) {
+    dev_warn(
+      agnocast_device,
+      "subscriber_ids_buffer_size must be MAX_SUBSCRIBER_NUM (%d), but got %u. "
+      "(agnocast_ioctl_publish_msg)\n",
+      MAX_SUBSCRIBER_NUM, subscriber_ids_buffer_size);
     return -EINVAL;
   }
+
+  down_read(&global_htables_rwsem);
+
+  struct topic_wrapper * wrapper = find_topic(topic_name, ipc_ns);
+  if (!wrapper) {
+    dev_warn(agnocast_device, "Topic (topic_name=%s) not found. (ioctl_publish_msg)\n", topic_name);
+    ret = -EINVAL;
+    goto unlock_only_global;
+  }
+
+  down_write(&wrapper->topic_rwsem);
 
   struct publisher_info * pub_info = find_publisher_info(wrapper, publisher_id);
   if (!pub_info) {
     dev_warn(
-      agnocast_device, "Publisher (id=%d) not found in the topic (topic_name=%s). (publish_msg)\n",
+      agnocast_device,
+      "Publisher (id=%d) not found in the topic (topic_name=%s). (ioctl_publish_msg)\n",
       publisher_id, topic_name);
-    return -EINVAL;
+    ret = -EINVAL;
+    goto unlock_all;
   }
 
   struct process_info * proc_info = find_process_info(pub_info->pid);
   if (!proc_info) {
-    dev_warn(agnocast_device, "Process (pid=%d) does not exist. (publish_msg)\n", pub_info->pid);
-    return -EINVAL;
+    dev_warn(
+      agnocast_device, "Process (pid=%d) does not exist. (ioctl_publish_msg)\n", pub_info->pid);
+    ret = -EINVAL;
+    goto unlock_all;
   }
 
   uint64_t mempool_start = proc_info->mempool_entry->addr;
-  uint64_t mempool_end = mempool_start + proc_info->shm_size;
+  uint64_t mempool_end = mempool_start + mempool_size_bytes;
   if (msg_virtual_address < mempool_start || msg_virtual_address >= mempool_end) {
-    dev_warn(agnocast_device, "msg_virtual_address is out of bounds. (publish_msg)\n");
-    return -EINVAL;
+    dev_warn(agnocast_device, "msg_virtual_address is out of bounds. (ioctl_publish_msg)\n");
+    ret = -EINVAL;
+    goto unlock_all;
   }
 
-  int ret = insert_message_entry(wrapper, pub_info, msg_virtual_address, ioctl_ret);
+  ret = insert_message_entry(wrapper, pub_info, msg_virtual_address, ioctl_ret);
   if (ret < 0) {
-    return ret;
+    goto unlock_all;
   }
 
   ret = release_msgs_to_meet_depth(wrapper, pub_info, ioctl_ret);
   if (ret < 0) {
-    return ret;
+    goto unlock_all;
   }
 
-  int subscriber_num = 0;
+  uint32_t subscriber_num = 0;
   struct subscriber_info * sub_info;
   int bkt_sub_info;
   hash_for_each(wrapper->topic.sub_info_htable, bkt_sub_info, sub_info, node)
   {
     if (sub_info->is_take_sub) continue;
-    ioctl_ret->ret_subscriber_ids[subscriber_num] = sub_info->id;
+    if (sub_info->ignore_local_publications && (sub_info->pid == pub_info->pid)) {
+      continue;
+    }
+    subscriber_ids_out[subscriber_num] = sub_info->id;
     subscriber_num++;
   }
   ioctl_ret->ret_subscriber_num = subscriber_num;
 
-  return 0;
+unlock_all:
+  up_write(&wrapper->topic_rwsem);
+unlock_only_global:
+  up_read(&global_htables_rwsem);
+  return ret;
 }
 
-int receive_msg(
-  const char * topic_name, const struct ipc_namespace * ipc_ns,
+// Find the first entry with entry_id >= target_entry_id
+static struct rb_node * find_first_entry_ge(struct rb_root * root, const int64_t target_entry_id)
+{
+  struct rb_node ** curr = &(root->rb_node);
+  struct rb_node * candidate = NULL;
+
+  while (*curr) {
+    const struct entry_node * en = container_of(*curr, struct entry_node, node);
+    if (en->entry_id >= target_entry_id) {
+      candidate = *curr;
+      curr = &((*curr)->rb_left);
+    } else {
+      curr = &((*curr)->rb_right);
+    }
+  }
+
+  return candidate;
+}
+
+static int receive_msg_core(
+  struct topic_wrapper * wrapper, struct subscriber_info * sub_info,
   const topic_local_id_t subscriber_id, union ioctl_receive_msg_args * ioctl_ret)
 {
-  struct topic_wrapper * wrapper = find_topic(topic_name, ipc_ns);
-  if (!wrapper) {
-    dev_warn(agnocast_device, "Topic (topic_name=%s) not found. (receive_msg)\n", topic_name);
-    return -EINVAL;
-  }
-
-  struct subscriber_info * sub_info = find_subscriber_info(wrapper, subscriber_id);
-  if (!sub_info) {
-    dev_warn(
-      agnocast_device,
-      "Subscriber (id=%d) for the topic (topic_name=%s) not found. "
-      "(receive_msg)\n",
-      subscriber_id, topic_name);
-    return -EINVAL;
-  }
-
-  // Receive msg
   ioctl_ret->ret_entry_num = 0;
-  bool sub_info_updated = false;
-  int64_t latest_received_entry_id = sub_info->latest_received_entry_id;
-  for (struct rb_node * node = rb_last(&wrapper->topic.entries); node; node = rb_prev(node)) {
+  ioctl_ret->ret_call_again = false;
+
+  struct rb_node * newest_node = rb_last(&wrapper->topic.entries);
+  if (!newest_node) {
+    return 0;
+  }
+
+  const struct entry_node * newest_en = container_of(newest_node, struct entry_node, node);
+  const int64_t newest_entry_id = newest_en->entry_id;
+
+  // Calculate start_entry_id = max(newest - qos_depth + 1, latest_received_entry_id + 1)
+  const int64_t latest_received_entry_id = sub_info->latest_received_entry_id;
+  const int64_t qos_start = newest_entry_id - (int64_t)sub_info->qos_depth + 1;
+  const int64_t start_entry_id =
+    (qos_start > latest_received_entry_id) ? qos_start : (latest_received_entry_id + 1);
+
+  struct rb_node * node = find_first_entry_ge(&wrapper->topic.entries, start_entry_id);
+
+  for (; node; node = rb_next(node)) {
     struct entry_node * en = container_of(node, struct entry_node, node);
-    if (
-      (en->entry_id <= latest_received_entry_id) ||
-      (sub_info->qos_depth == ioctl_ret->ret_entry_num)) {
+
+    if (MAX_RECEIVE_NUM == ioctl_ret->ret_entry_num) {
+      ioctl_ret->ret_call_again = true;
       break;
     }
 
@@ -988,8 +1135,8 @@ int receive_msg(
       dev_warn(
         agnocast_device,
         "Unreachable: corresponding publisher(id=%d) not found for entry(id=%lld) in "
-        "topic(topic_name=%s). (receive_msg)\n",
-        en->publisher_id, en->entry_id, topic_name);
+        "topic(topic_name=%s). (receive_msg_core)\n",
+        en->publisher_id, en->entry_id, wrapper->key);
       return -ENODATA;
     }
 
@@ -998,7 +1145,11 @@ int receive_msg(
       continue;
     }
 
-    int ret = increment_sub_rc(en, subscriber_id);
+    if (sub_info->ignore_local_publications && (sub_info->pid == pub_info->pid)) {
+      continue;
+    }
+
+    int ret = add_subscriber_reference(en, subscriber_id);
     if (ret < 0) {
       return ret;
     }
@@ -1006,46 +1157,102 @@ int receive_msg(
     ioctl_ret->ret_entry_ids[ioctl_ret->ret_entry_num] = en->entry_id;
     ioctl_ret->ret_entry_addrs[ioctl_ret->ret_entry_num] = en->msg_virtual_address;
     ioctl_ret->ret_entry_num++;
-
-    if (!sub_info_updated) {
-      sub_info->latest_received_entry_id = en->entry_id;
-      sub_info_updated = true;
-    }
   }
 
-  // Check if there is any publisher that need to be mmapped
-  if (!sub_info->need_mmap_update) {
-    ioctl_ret->ret_pub_shm_info.publisher_num = 0;
-    return 0;
+  if (ioctl_ret->ret_entry_num > 0) {
+    sub_info->latest_received_entry_id = ioctl_ret->ret_entry_ids[ioctl_ret->ret_entry_num - 1];
   }
-
-  int ret = set_publisher_shm_info(wrapper, sub_info->pid, &ioctl_ret->ret_pub_shm_info);
-  if (ret < 0) {
-    return ret;
-  }
-
-  sub_info->need_mmap_update = false;
 
   return 0;
 }
 
-int take_msg(
+int agnocast_ioctl_receive_msg(
   const char * topic_name, const struct ipc_namespace * ipc_ns,
-  const topic_local_id_t subscriber_id, bool allow_same_message,
-  union ioctl_take_msg_args * ioctl_ret)
+  const topic_local_id_t subscriber_id, struct publisher_shm_info * pub_shm_infos,
+  uint32_t pub_shm_infos_size, union ioctl_receive_msg_args * ioctl_ret)
 {
+  int ret = 0;
+
+  down_read(&global_htables_rwsem);
+
   struct topic_wrapper * wrapper = find_topic(topic_name, ipc_ns);
   if (!wrapper) {
-    dev_warn(agnocast_device, "Topic (topic_name=%s) not found. (take_msg)\n", topic_name);
-    return -EINVAL;
+    dev_warn(
+      agnocast_device, "Topic (topic_name=%s) not found. (agnocast_ioctl_receive_msg)\n",
+      topic_name);
+    ret = -EINVAL;
+    goto unlock_only_global;
   }
+
+  // Use write lock because we modify sub_info fields (latest_received_entry_id, need_mmap_update)
+  down_write(&wrapper->topic_rwsem);
 
   struct subscriber_info * sub_info = find_subscriber_info(wrapper, subscriber_id);
   if (!sub_info) {
     dev_warn(
-      agnocast_device, "Subscriber (id=%d) for the topic (topic_name=%s) not found. (take_msg)\n",
+      agnocast_device,
+      "Subscriber (id=%d) for the topic (topic_name=%s) not found. "
+      "(agnocast_ioctl_receive_msg)\n",
       subscriber_id, topic_name);
-    return -EINVAL;
+    ret = -EINVAL;
+    goto unlock_all;
+  }
+
+  ret = receive_msg_core(wrapper, sub_info, subscriber_id, ioctl_ret);
+  if (ret < 0) {
+    goto unlock_all;
+  }
+
+  // Check if there is any publisher that need to be mmapped
+  if (!sub_info->need_mmap_update) {
+    ioctl_ret->ret_pub_shm_num = 0;
+    goto unlock_all;
+  }
+
+  ret = set_publisher_shm_info(
+    wrapper, sub_info->pid, pub_shm_infos, pub_shm_infos_size, &ioctl_ret->ret_pub_shm_num);
+  if (ret < 0) {
+    goto unlock_all;
+  }
+
+  sub_info->need_mmap_update = false;
+
+unlock_all:
+  up_write(&wrapper->topic_rwsem);
+unlock_only_global:
+  up_read(&global_htables_rwsem);
+  return ret;
+}
+
+int agnocast_ioctl_take_msg(
+  const char * topic_name, const struct ipc_namespace * ipc_ns,
+  const topic_local_id_t subscriber_id, bool allow_same_message,
+  struct publisher_shm_info * pub_shm_infos, uint32_t pub_shm_infos_size,
+  union ioctl_take_msg_args * ioctl_ret)
+{
+  int ret = 0;
+
+  down_read(&global_htables_rwsem);
+
+  struct topic_wrapper * wrapper = find_topic(topic_name, ipc_ns);
+  if (!wrapper) {
+    dev_warn(
+      agnocast_device, "Topic (topic_name=%s) not found. (agnocast_ioctl_take_msg)\n", topic_name);
+    ret = -EINVAL;
+    goto unlock_only_global;
+  }
+
+  // Use write lock because we modify sub_info fields (latest_received_entry_id, need_mmap_update)
+  down_write(&wrapper->topic_rwsem);
+
+  struct subscriber_info * sub_info = find_subscriber_info(wrapper, subscriber_id);
+  if (!sub_info) {
+    dev_warn(
+      agnocast_device,
+      "Subscriber (id=%d) for the topic (topic_name=%s) not found. (ioctl_take_msg)\n",
+      subscriber_id, topic_name);
+    ret = -EINVAL;
+    goto unlock_all;
   }
 
   // These remains 0 if no message is found to take.
@@ -1072,13 +1279,18 @@ int take_msg(
       dev_warn(
         agnocast_device,
         "Unreachable: corresponding publisher(id=%d) not found for entry(id=%lld) in "
-        "topic(topic_name=%s). (take_msg)\n",
+        "topic(topic_name=%s). (ioctl_take_msg)\n",
         en->publisher_id, en->entry_id, topic_name);
-      return -ENODATA;
+      ret = -ENODATA;
+      goto unlock_all;
     }
 
     const struct process_info * proc_info = find_process_info(pub_info->pid);
     if (!proc_info || proc_info->exited) {
+      continue;
+    }
+
+    if (sub_info->ignore_local_publications && (sub_info->pid == pub_info->pid)) {
       continue;
     }
 
@@ -1087,9 +1299,18 @@ int take_msg(
   }
 
   if (candidate_en) {
-    int ret = increment_sub_rc(candidate_en, subscriber_id);
-    if (ret < 0) {
-      return ret;
+    // When allow_same_message is true and the subscriber already holds a reference,
+    // skip adding a duplicate reference.
+    bool already_referenced = false;
+    if (allow_same_message) {
+      already_referenced = test_bit(subscriber_id, candidate_en->referencing_subscribers);
+    }
+
+    if (!already_referenced) {
+      ret = add_subscriber_reference(candidate_en, subscriber_id);
+      if (ret < 0) {
+        goto unlock_all;
+      }
     }
 
     ioctl_ret->ret_addr = candidate_en->msg_virtual_address;
@@ -1100,61 +1321,312 @@ int take_msg(
 
   // Check if there is any publisher that need to be mmapped
   if (!sub_info->need_mmap_update) {
-    ioctl_ret->ret_pub_shm_info.publisher_num = 0;
-    return 0;
+    ioctl_ret->ret_pub_shm_num = 0;
+    goto unlock_all;
   }
 
-  int ret = set_publisher_shm_info(wrapper, sub_info->pid, &ioctl_ret->ret_pub_shm_info);
+  ret = set_publisher_shm_info(
+    wrapper, sub_info->pid, pub_shm_infos, pub_shm_infos_size, &ioctl_ret->ret_pub_shm_num);
   if (ret < 0) {
-    return ret;
+    goto unlock_all;
   }
 
   sub_info->need_mmap_update = false;
 
-  return 0;
+unlock_all:
+  up_write(&wrapper->topic_rwsem);
+unlock_only_global:
+  up_read(&global_htables_rwsem);
+  return ret;
 }
 
-int get_subscriber_num(
-  const char * topic_name, const struct ipc_namespace * ipc_ns,
+// Forward declaration
+static struct bridge_info * find_bridge_info(
+  const char * topic_name, const struct ipc_namespace * ipc_ns);
+
+int agnocast_ioctl_get_subscriber_num(
+  const char * topic_name, const struct ipc_namespace * ipc_ns, const pid_t pid,
   union ioctl_get_subscriber_num_args * ioctl_ret)
 {
+  ioctl_ret->ret_other_process_subscriber_num = 0;
+  ioctl_ret->ret_same_process_subscriber_num = 0;
+  ioctl_ret->ret_ros2_subscriber_num = 0;
+  ioctl_ret->ret_a2r_bridge_exist = false;
+  ioctl_ret->ret_r2a_bridge_exist = false;
+
+  down_read(&global_htables_rwsem);
+
   struct topic_wrapper * wrapper = find_topic(topic_name, ipc_ns);
-  if (wrapper) {
-    ioctl_ret->ret_subscriber_num = get_size_sub_info_htable(wrapper);
-  } else {
-    ioctl_ret->ret_subscriber_num = 0;
+
+  if (!wrapper) {
+    up_read(&global_htables_rwsem);
+    return 0;
   }
+
+  down_read(&wrapper->topic_rwsem);
+
+  uint32_t inter_count = 0;
+  uint32_t intra_count = 0;
+
+  struct subscriber_info * sub_info;
+  int bkt_sub;
+  hash_for_each(wrapper->topic.sub_info_htable, bkt_sub, sub_info, node)
+  {
+    if (sub_info->is_bridge) {
+      ioctl_ret->ret_a2r_bridge_exist = true;
+    }
+    if (sub_info->pid == pid) {
+      intra_count++;
+    } else {
+      inter_count++;
+    }
+  }
+
+  struct publisher_info * pub_info;
+  int bkt_pub;
+  hash_for_each(wrapper->topic.pub_info_htable, bkt_pub, pub_info, node)
+  {
+    if (pub_info->is_bridge) {
+      ioctl_ret->ret_r2a_bridge_exist = true;
+      break;
+    }
+  }
+
+  ioctl_ret->ret_other_process_subscriber_num = inter_count;
+  ioctl_ret->ret_same_process_subscriber_num = intra_count;
+  ioctl_ret->ret_ros2_subscriber_num = wrapper->topic.ros2_subscriber_num;
+
+  up_read(&wrapper->topic_rwsem);
+  up_read(&global_htables_rwsem);
 
   return 0;
 }
 
-static int get_exit_process(
-  const struct ipc_namespace * ipc_ns, struct ioctl_get_exit_process_args * ioctl_ret)
+int agnocast_ioctl_set_ros2_subscriber_num(
+  const char * topic_name, const struct ipc_namespace * ipc_ns, uint32_t count)
+{
+  int ret = 0;
+
+  down_read(&global_htables_rwsem);
+
+  struct topic_wrapper * wrapper = find_topic(topic_name, ipc_ns);
+  if (wrapper) {
+    down_write(&wrapper->topic_rwsem);
+    wrapper->topic.ros2_subscriber_num = count;
+    up_write(&wrapper->topic_rwsem);
+  } else {
+    ret = -ENOENT;
+  }
+
+  up_read(&global_htables_rwsem);
+  return ret;
+}
+
+int agnocast_ioctl_set_ros2_publisher_num(
+  const char * topic_name, const struct ipc_namespace * ipc_ns, uint32_t count)
+{
+  int ret = 0;
+
+  down_read(&global_htables_rwsem);
+
+  struct topic_wrapper * wrapper = find_topic(topic_name, ipc_ns);
+  if (wrapper) {
+    down_write(&wrapper->topic_rwsem);
+    wrapper->topic.ros2_publisher_num = count;
+    up_write(&wrapper->topic_rwsem);
+  } else {
+    ret = -ENOENT;
+  }
+
+  up_read(&global_htables_rwsem);
+  return ret;
+}
+
+int agnocast_ioctl_get_publisher_num(
+  const char * topic_name, const struct ipc_namespace * ipc_ns,
+  union ioctl_get_publisher_num_args * ioctl_ret)
+{
+  ioctl_ret->ret_publisher_num = 0;
+  ioctl_ret->ret_ros2_publisher_num = 0;
+  ioctl_ret->ret_r2a_bridge_exist = false;
+  ioctl_ret->ret_a2r_bridge_exist = false;
+
+  down_read(&global_htables_rwsem);
+
+  struct topic_wrapper * wrapper = find_topic(topic_name, ipc_ns);
+
+  if (!wrapper) {
+    up_read(&global_htables_rwsem);
+    return 0;
+  }
+
+  down_read(&wrapper->topic_rwsem);
+
+  ioctl_ret->ret_publisher_num = get_size_pub_info_htable(wrapper);
+  ioctl_ret->ret_ros2_publisher_num = wrapper->topic.ros2_publisher_num;
+
+  struct publisher_info * pub_info;
+  int bkt_pub;
+  hash_for_each(wrapper->topic.pub_info_htable, bkt_pub, pub_info, node)
+  {
+    if (pub_info->is_bridge) {
+      ioctl_ret->ret_r2a_bridge_exist = true;
+      break;
+    }
+  }
+
+  struct subscriber_info * sub_info;
+  int bkt_sub;
+  hash_for_each(wrapper->topic.sub_info_htable, bkt_sub, sub_info, node)
+  {
+    if (sub_info->is_bridge) {
+      ioctl_ret->ret_a2r_bridge_exist = true;
+      break;
+    }
+  }
+
+  up_read(&wrapper->topic_rwsem);
+  up_read(&global_htables_rwsem);
+
+  return 0;
+}
+
+static void free_exit_subscription_list(struct process_info * proc_info)
+{
+  struct exit_subscription_entry * entry;
+  struct exit_subscription_entry * tmp_entry;
+  list_for_each_entry_safe(entry, tmp_entry, &proc_info->exit_subscription_list, list)
+  {
+    list_del(&entry->list);
+    kfree(entry);
+  }
+  proc_info->exit_subscription_count = 0;
+}
+
+// Two-phase ioctl for exit process cleanup:
+//   Phase 1 (agnocast_ioctl_get_exit_process): read-only copy of subscription entries to kernel
+//   buffer.
+//   Phase 2 (agnocast_commit_exit_process): delete entries and free proc_info.
+//
+// The primary motivation for the two-phase split is to avoid holding the global write lock during
+// copy_to_user, which can trigger page faults with potentially unbounded latency. Since the write
+// lock blocks all publish/receive operations across every topic, a page fault during copy_to_user
+// would stall the entire data plane. By releasing the lock between phases, the dispatch handler
+// performs copy_to_user without any lock held.
+//
+// As a secondary benefit, Phase 2 runs only after the critical copies (ret_pid and
+// ret_subscription_mq_info_num) succeed, so subscription entries are never permanently lost.
+// ret_daemon_should_exit is patched via a separate copy_to_user after Phase 2; if that final copy
+// fails, the daemon merely stays alive one extra poll cycle — no resource leak.
+int agnocast_ioctl_get_exit_process(
+  const struct ipc_namespace * ipc_ns, struct ioctl_get_exit_process_args * ioctl_ret,
+  struct exit_subscription_mq_info * mq_info_buf, uint32_t mq_info_buf_size, pid_t * out_global_pid)
 {
   ioctl_ret->ret_pid = -1;
+  ioctl_ret->ret_subscription_mq_info_num = 0;
+  ioctl_ret->ret_daemon_should_exit = false;
+  *out_global_pid = -1;
+
+  down_write(&global_htables_rwsem);
+
   struct process_info * proc_info;
   int bkt;
-  struct hlist_node * tmp;
-  hash_for_each_safe(proc_info_htable, bkt, tmp, proc_info, node)
+  hash_for_each(proc_info_htable, bkt, proc_info, node)
   {
     if (!ipc_eq(proc_info->ipc_ns, ipc_ns) || !proc_info->exited) {
       continue;
     }
 
+    // If there are subscription entries but no buffer to receive them, discard the entries
+    // and warn. The subscription MQs will leak, but shm/bridge cleanup can still proceed and
+    // the daemon won't hang indefinitely.
+    if (
+      !list_empty(&proc_info->exit_subscription_list) &&
+      (mq_info_buf == NULL || mq_info_buf_size == 0)) {
+      dev_warn(
+        agnocast_device,
+        "No MQ info buffer provided for pid=%d with %u subscription entries; "
+        "subscription MQs will leak. (agnocast_ioctl_get_exit_process)\n",
+        proc_info->global_pid, proc_info->exit_subscription_count);
+      free_exit_subscription_list(proc_info);
+    }
+
     ioctl_ret->ret_pid = proc_info->local_pid;
-    hash_del(&proc_info->node);
-    kfree(proc_info);
+    *out_global_pid = proc_info->global_pid;
+
+    // Read-only copy of subscription info to kernel buffer. Entries are NOT deleted here;
+    // deletion is deferred to agnocast_commit_exit_process() after copy_to_user succeeds.
+    uint32_t count = 0;
+    if (mq_info_buf != NULL && mq_info_buf_size > 0) {
+      struct exit_subscription_entry * entry;
+      list_for_each_entry(entry, &proc_info->exit_subscription_list, list)
+      {
+        // cppcheck-suppress unsignedLessThanZero ; mq_info_buf_size > 0 is guaranteed by the guard
+        // above
+        if (count >= mq_info_buf_size) {
+          dev_warn(
+            agnocast_device,
+            "mq_info_buf is full, remaining entries kept for next poll. "
+            "(agnocast_ioctl_get_exit_process)\n");
+          break;
+        }
+        strscpy(mq_info_buf[count].topic_name, entry->topic_name, TOPIC_NAME_BUFFER_SIZE);
+        mq_info_buf[count].subscriber_id = entry->subscriber_id;
+        count++;
+      }
+    }
+    ioctl_ret->ret_subscription_mq_info_num = count;
     break;
   }
 
-  ioctl_ret->ret_daemon_should_exit = !check_daemon_necessity(ipc_ns);
+  up_write(&global_htables_rwsem);
   return 0;
 }
 
-int get_topic_list(
+void agnocast_commit_exit_process(
+  const struct ipc_namespace * ipc_ns, pid_t global_pid, uint32_t committed_count,
+  bool * ret_daemon_should_exit)
+{
+  down_write(&global_htables_rwsem);
+
+  if (global_pid >= 0) {
+    struct process_info * proc_info = find_process_info(global_pid);
+    if (proc_info) {
+      // Delete the first committed_count entries (matching the read-only copy order).
+      uint32_t deleted = 0;
+      struct exit_subscription_entry * entry;
+      struct exit_subscription_entry * tmp_entry;
+      list_for_each_entry_safe(entry, tmp_entry, &proc_info->exit_subscription_list, list)
+      {
+        // cppcheck-suppress unsignedLessThanZero ; both are uint32_t, committed_count == 0
+        // correctly skips the loop
+        if (deleted >= committed_count) break;
+        list_del(&entry->list);
+        kfree(entry);
+        proc_info->exit_subscription_count--;
+        deleted++;
+      }
+
+      // Free proc_info only when all subscription entries have been consumed.
+      if (list_empty(&proc_info->exit_subscription_list)) {
+        hash_del_rcu(&proc_info->node);
+        kfree_rcu(proc_info, rcu_head);
+      }
+    }
+  }
+
+  *ret_daemon_should_exit = (get_process_num(ipc_ns) == 0);
+
+  up_write(&global_htables_rwsem);
+}
+
+int agnocast_ioctl_get_topic_list(
   const struct ipc_namespace * ipc_ns, union ioctl_topic_list_args * topic_list_args)
 {
+  int ret = 0;
   uint32_t topic_num = 0;
+
+  down_read(&global_htables_rwsem);
 
   struct topic_wrapper * wrapper;
   int bkt_topic;
@@ -1164,16 +1636,20 @@ int get_topic_list(
       continue;
     }
 
-    if (topic_num >= MAX_TOPIC_NUM) {
-      dev_warn(agnocast_device, "The number of topics is over MAX_TOPIC_NUM=%d\n", MAX_TOPIC_NUM);
-      return -ENOBUFS;
+    if (topic_num >= MAX_TOPIC_NUM || topic_num >= topic_list_args->topic_name_buffer_size) {
+      dev_warn(
+        agnocast_device, "Topic count exceeds limit: MAX_TOPIC_NUM=%d, topic_name_buffer_size=%u\n",
+        MAX_TOPIC_NUM, topic_list_args->topic_name_buffer_size);
+      ret = -ENOBUFS;
+      goto unlock;
     }
 
     if (copy_to_user(
           (char __user *)(topic_list_args->topic_name_buffer_addr +
                           topic_num * TOPIC_NAME_BUFFER_SIZE),
           wrapper->key, strlen(wrapper->key) + 1)) {
-      return -EFAULT;
+      ret = -EFAULT;
+      goto unlock;
     }
 
     topic_num++;
@@ -1181,14 +1657,19 @@ int get_topic_list(
 
   topic_list_args->ret_topic_num = topic_num;
 
-  return 0;
+unlock:
+  up_read(&global_htables_rwsem);
+  return ret;
 }
 
-static int get_node_subscriber_topics(
+int agnocast_ioctl_get_node_subscriber_topics(
   const struct ipc_namespace * ipc_ns, const char * node_name,
   union ioctl_node_info_args * node_info_args)
 {
+  int ret = 0;
   uint32_t topic_num = 0;
+
+  down_read(&global_htables_rwsem);
 
   struct topic_wrapper * wrapper;
   int bkt_topic;
@@ -1198,40 +1679,59 @@ static int get_node_subscriber_topics(
     if (!ipc_eq(ipc_ns, wrapper->ipc_ns)) {
       continue;
     }
+
+    down_read(&wrapper->topic_rwsem);
+
     struct subscriber_info * sub_info;
     int bkt_sub_info;
+    bool found = false;
     hash_for_each(wrapper->topic.sub_info_htable, bkt_sub_info, sub_info, node)
     {
-      if (strncmp(sub_info->node_name, node_name, strlen(node_name)) == 0) {
-        if (topic_num >= MAX_TOPIC_NUM) {
-          dev_warn(
-            agnocast_device, "The number of topics is over MAX_TOPIC_NUM=%d\n", MAX_TOPIC_NUM);
-          return -ENOBUFS;
-        }
-
-        if (copy_to_user(
-              (char __user *)(node_info_args->topic_name_buffer_addr +
-                              topic_num * TOPIC_NAME_BUFFER_SIZE),
-              wrapper->key, strlen(wrapper->key) + 1)) {
-          return -EFAULT;
-        }
-
-        topic_num++;
+      if (strcmp(sub_info->node_name, node_name) == 0) {
+        found = true;
         break;
       }
+    }
+
+    up_read(&wrapper->topic_rwsem);
+
+    if (found) {
+      if (topic_num >= MAX_TOPIC_NUM || topic_num >= node_info_args->topic_name_buffer_size) {
+        dev_warn(
+          agnocast_device,
+          "Topic count exceeds limit: MAX_TOPIC_NUM=%d, topic_name_buffer_size=%u\n", MAX_TOPIC_NUM,
+          node_info_args->topic_name_buffer_size);
+        ret = -ENOBUFS;
+        goto unlock;
+      }
+
+      if (copy_to_user(
+            (char __user *)(node_info_args->topic_name_buffer_addr +
+                            topic_num * TOPIC_NAME_BUFFER_SIZE),
+            wrapper->key, strlen(wrapper->key) + 1)) {
+        ret = -EFAULT;
+        goto unlock;
+      }
+
+      topic_num++;
     }
   }
 
   node_info_args->ret_topic_num = topic_num;
 
-  return 0;
+unlock:
+  up_read(&global_htables_rwsem);
+  return ret;
 }
 
-static int get_node_publisher_topics(
+int agnocast_ioctl_get_node_publisher_topics(
   const struct ipc_namespace * ipc_ns, const char * node_name,
   union ioctl_node_info_args * node_info_args)
 {
+  int ret = 0;
   uint32_t topic_num = 0;
+
+  down_read(&global_htables_rwsem);
 
   struct topic_wrapper * wrapper;
   int bkt_topic;
@@ -1241,472 +1741,1303 @@ static int get_node_publisher_topics(
     if (!ipc_eq(ipc_ns, wrapper->ipc_ns)) {
       continue;
     }
+
+    down_read(&wrapper->topic_rwsem);
+
     struct publisher_info * pub_info;
     int bkt_pub_info;
+    bool found = false;
     hash_for_each(wrapper->topic.pub_info_htable, bkt_pub_info, pub_info, node)
     {
-      if (strncmp(pub_info->node_name, node_name, strlen(node_name)) == 0) {
-        if (topic_num >= MAX_TOPIC_NUM) {
-          dev_warn(
-            agnocast_device, "The number of topics is over MAX_TOPIC_NUM=%d\n", MAX_TOPIC_NUM);
-          return -ENOBUFS;
-        }
-
-        if (copy_to_user(
-              (char __user *)(node_info_args->topic_name_buffer_addr +
-                              topic_num * TOPIC_NAME_BUFFER_SIZE),
-              wrapper->key, strlen(wrapper->key) + 1)) {
-          return -EFAULT;
-        }
-
-        topic_num++;
+      if (strcmp(pub_info->node_name, node_name) == 0) {
+        found = true;
         break;
       }
+    }
+
+    up_read(&wrapper->topic_rwsem);
+
+    if (found) {
+      if (topic_num >= MAX_TOPIC_NUM || topic_num >= node_info_args->topic_name_buffer_size) {
+        dev_warn(
+          agnocast_device,
+          "Topic count exceeds limit: MAX_TOPIC_NUM=%d, topic_name_buffer_size=%u\n", MAX_TOPIC_NUM,
+          node_info_args->topic_name_buffer_size);
+        ret = -ENOBUFS;
+        goto unlock;
+      }
+
+      if (copy_to_user(
+            (char __user *)(node_info_args->topic_name_buffer_addr +
+                            topic_num * TOPIC_NAME_BUFFER_SIZE),
+            wrapper->key, strlen(wrapper->key) + 1)) {
+        ret = -EFAULT;
+        goto unlock;
+      }
+
+      topic_num++;
     }
   }
 
   node_info_args->ret_topic_num = topic_num;
 
-  return 0;
+unlock:
+  up_read(&global_htables_rwsem);
+  return ret;
 }
 
-static int get_topic_subscriber_info(
+int agnocast_ioctl_get_topic_subscriber_info(
   const char * topic_name, const struct ipc_namespace * ipc_ns,
   union ioctl_topic_info_args * topic_info_args)
 {
+  int ret = 0;
   topic_info_args->ret_topic_info_ret_num = 0;
+
+  down_read(&global_htables_rwsem);
 
   struct topic_wrapper * wrapper = find_topic(topic_name, ipc_ns);
   if (!wrapper) {
+    up_read(&global_htables_rwsem);
     return 0;
   }
 
-  uint32_t subscriber_num = 0;
+  down_read(&wrapper->topic_rwsem);
+
   struct subscriber_info * sub_info;
   int bkt_sub_info;
 
   struct topic_info_ret __user * user_buffer =
     (struct topic_info_ret *)topic_info_args->topic_info_ret_buffer_addr;
 
-  struct topic_info_ret * topic_info_mem =
-    kmalloc(sizeof(struct topic_info_ret) * MAX_TOPIC_INFO_RET_NUM, GFP_KERNEL);
-  if (!topic_info_mem) {
-    return -ENOMEM;
-  }
-
+  // Count actual subscribers first
+  uint32_t subscriber_num = 0;
   hash_for_each(wrapper->topic.sub_info_htable, bkt_sub_info, sub_info, node)
   {
-    if (subscriber_num >= MAX_TOPIC_INFO_RET_NUM) {
-      dev_warn(
-        agnocast_device, "The number of subscribers is over MAX_TOPIC_INFO_RET_NUM=%d\n",
-        MAX_TOPIC_INFO_RET_NUM);
-      kfree(topic_info_mem);
-      return -ENOBUFS;
-    }
-
-    if (!sub_info->node_name) {
-      kfree(topic_info_mem);
-      return -EFAULT;
-    }
-
-    struct topic_info_ret * temp_info = &topic_info_mem[subscriber_num];
-
-    strncpy(temp_info->node_name, sub_info->node_name, strlen(sub_info->node_name));
-    temp_info->qos_depth = sub_info->qos_depth;
-    temp_info->qos_is_transient_local = sub_info->qos_is_transient_local;
-
     subscriber_num++;
   }
 
-  if (copy_to_user(user_buffer, topic_info_mem, sizeof(struct topic_info_ret) * subscriber_num)) {
-    kfree(topic_info_mem);
-    return -EFAULT;
+  if (subscriber_num > topic_info_args->topic_info_ret_buffer_size) {
+    dev_warn(
+      agnocast_device,
+      "Subscriber count exceeds limit: subscriber_num=%u, "
+      "topic_info_ret_buffer_size=%u\n",
+      subscriber_num, topic_info_args->topic_info_ret_buffer_size);
+    ret = -ENOBUFS;
+    goto unlock;
   }
 
-  kfree(topic_info_mem);
+  struct topic_info_ret * topic_info_mem = NULL;
+  if (subscriber_num > 0) {
+    topic_info_mem = kvzalloc(sizeof(struct topic_info_ret) * subscriber_num, GFP_KERNEL);
+    if (!topic_info_mem) {
+      ret = -ENOMEM;
+      goto unlock;
+    }
+  }
+
+  uint32_t idx = 0;
+  hash_for_each(wrapper->topic.sub_info_htable, bkt_sub_info, sub_info, node)
+  {
+    if (!sub_info->node_name) {
+      kvfree(topic_info_mem);
+      ret = -EFAULT;
+      goto unlock;
+    }
+
+    struct topic_info_ret * temp_info = &topic_info_mem[idx];
+
+    strscpy(temp_info->node_name, sub_info->node_name, NODE_NAME_BUFFER_SIZE);
+    temp_info->qos_depth = sub_info->qos_depth;
+    temp_info->qos_is_transient_local = sub_info->qos_is_transient_local;
+    temp_info->qos_is_reliable = sub_info->qos_is_reliable;
+    temp_info->is_bridge = sub_info->is_bridge;
+
+    idx++;
+  }
+
+  if (
+    subscriber_num > 0 &&
+    copy_to_user(user_buffer, topic_info_mem, sizeof(struct topic_info_ret) * subscriber_num)) {
+    kvfree(topic_info_mem);
+    ret = -EFAULT;
+    goto unlock;
+  }
+
+  kvfree(topic_info_mem);
   topic_info_args->ret_topic_info_ret_num = subscriber_num;
 
-  return 0;
+unlock:
+  up_read(&wrapper->topic_rwsem);
+  up_read(&global_htables_rwsem);
+  return ret;
 }
 
-static int get_topic_publisher_info(
+int agnocast_ioctl_get_topic_publisher_info(
   const char * topic_name, const struct ipc_namespace * ipc_ns,
   union ioctl_topic_info_args * topic_info_args)
 {
+  int ret = 0;
   topic_info_args->ret_topic_info_ret_num = 0;
+
+  down_read(&global_htables_rwsem);
 
   struct topic_wrapper * wrapper = find_topic(topic_name, ipc_ns);
   if (!wrapper) {
+    up_read(&global_htables_rwsem);
     return 0;
   }
 
-  uint32_t publisher_num = 0;
+  down_read(&wrapper->topic_rwsem);
+
   struct publisher_info * pub_info;
   int bkt_pub_info;
 
   struct topic_info_ret __user * user_buffer =
     (struct topic_info_ret *)topic_info_args->topic_info_ret_buffer_addr;
 
-  struct topic_info_ret * topic_info_mem =
-    kmalloc(sizeof(struct topic_info_ret) * MAX_TOPIC_INFO_RET_NUM, GFP_KERNEL);
-  if (!topic_info_mem) {
-    return -ENOMEM;
-  }
-
+  // Count actual publishers first
+  uint32_t publisher_num = 0;
   hash_for_each(wrapper->topic.pub_info_htable, bkt_pub_info, pub_info, node)
   {
-    if (publisher_num >= MAX_TOPIC_INFO_RET_NUM) {
-      dev_warn(
-        agnocast_device, "The number of publishers is over MAX_TOPIC_INFO_RET_NUM=%d\n",
-        MAX_TOPIC_INFO_RET_NUM);
-      kfree(topic_info_mem);
-      return -ENOBUFS;
-    }
-
-    if (!pub_info->node_name) {
-      kfree(topic_info_mem);
-      return -EFAULT;
-    }
-
-    struct topic_info_ret * temp_info = &topic_info_mem[publisher_num];
-
-    strncpy(temp_info->node_name, pub_info->node_name, strlen(pub_info->node_name));
-    temp_info->qos_depth = pub_info->qos_depth;
-    temp_info->qos_is_transient_local = pub_info->qos_is_transient_local;
-
     publisher_num++;
   }
 
-  if (copy_to_user(user_buffer, topic_info_mem, sizeof(struct topic_info_ret) * publisher_num)) {
-    kfree(topic_info_mem);
-    return -EFAULT;
+  if (publisher_num > topic_info_args->topic_info_ret_buffer_size) {
+    dev_warn(
+      agnocast_device,
+      "Publisher count exceeds limit: publisher_num=%u, "
+      "topic_info_ret_buffer_size=%u\n",
+      publisher_num, topic_info_args->topic_info_ret_buffer_size);
+    ret = -ENOBUFS;
+    goto unlock;
   }
 
-  kfree(topic_info_mem);
+  struct topic_info_ret * topic_info_mem = NULL;
+  if (publisher_num > 0) {
+    topic_info_mem = kvzalloc(sizeof(struct topic_info_ret) * publisher_num, GFP_KERNEL);
+    if (!topic_info_mem) {
+      ret = -ENOMEM;
+      goto unlock;
+    }
+  }
+
+  uint32_t idx = 0;
+  hash_for_each(wrapper->topic.pub_info_htable, bkt_pub_info, pub_info, node)
+  {
+    if (!pub_info->node_name) {
+      kvfree(topic_info_mem);
+      ret = -EFAULT;
+      goto unlock;
+    }
+
+    struct topic_info_ret * temp_info = &topic_info_mem[idx];
+
+    strscpy(temp_info->node_name, pub_info->node_name, NODE_NAME_BUFFER_SIZE);
+    temp_info->qos_depth = pub_info->qos_depth;
+    temp_info->qos_is_transient_local = pub_info->qos_is_transient_local;
+    temp_info->qos_is_reliable = false;  // Publishers do not have reliability QoS
+    temp_info->is_bridge = pub_info->is_bridge;
+
+    idx++;
+  }
+
+  if (
+    publisher_num > 0 &&
+    copy_to_user(user_buffer, topic_info_mem, sizeof(struct topic_info_ret) * publisher_num)) {
+    kvfree(topic_info_mem);
+    ret = -EFAULT;
+    goto unlock;
+  }
+
+  kvfree(topic_info_mem);
   topic_info_args->ret_topic_info_ret_num = publisher_num;
 
+unlock:
+  up_read(&wrapper->topic_rwsem);
+  up_read(&global_htables_rwsem);
+  return ret;
+}
+
+int agnocast_ioctl_get_subscriber_qos(
+  const char * topic_name, const struct ipc_namespace * ipc_ns,
+  const topic_local_id_t subscriber_id, struct ioctl_get_subscriber_qos_args * args)
+{
+  int ret = 0;
+
+  down_read(&global_htables_rwsem);
+
+  struct topic_wrapper * wrapper = find_topic(topic_name, ipc_ns);
+  if (!wrapper) {
+    dev_dbg(
+      agnocast_device, "Topic (topic_name=%s) not found. (agnocast_ioctl_get_subscriber_qos)\n",
+      topic_name);
+    ret = -EINVAL;
+    goto unlock_only_global;
+  }
+
+  down_read(&wrapper->topic_rwsem);
+
+  const struct subscriber_info * sub_info = find_subscriber_info(wrapper, subscriber_id);
+  if (!sub_info) {
+    dev_dbg(
+      agnocast_device,
+      "Subscriber (id=%d) for the topic (topic_name=%s) not found. "
+      "(agnocast_ioctl_get_subscriber_qos)\n",
+      subscriber_id, topic_name);
+    ret = -EINVAL;
+    goto unlock_all;
+  }
+
+  args->ret_depth = sub_info->qos_depth;
+  args->ret_is_transient_local = sub_info->qos_is_transient_local;
+  args->ret_is_reliable = sub_info->qos_is_reliable;
+
+unlock_all:
+  up_read(&wrapper->topic_rwsem);
+unlock_only_global:
+  up_read(&global_htables_rwsem);
+  return ret;
+}
+
+int agnocast_ioctl_get_publisher_qos(
+  const char * topic_name, const struct ipc_namespace * ipc_ns, const topic_local_id_t publisher_id,
+  struct ioctl_get_publisher_qos_args * args)
+{
+  int ret = 0;
+
+  down_read(&global_htables_rwsem);
+
+  struct topic_wrapper * wrapper = find_topic(topic_name, ipc_ns);
+  if (!wrapper) {
+    dev_dbg(
+      agnocast_device, "Topic (topic_name=%s) not found. (agnocast_ioctl_get_publisher_qos)\n",
+      topic_name);
+    ret = -EINVAL;
+    goto unlock_only_global;
+  }
+
+  down_read(&wrapper->topic_rwsem);
+
+  const struct publisher_info * pub_info = find_publisher_info(wrapper, publisher_id);
+  if (!pub_info) {
+    dev_dbg(
+      agnocast_device,
+      "Publisher (id=%d) for the topic (topic_name=%s) not found. "
+      "(agnocast_ioctl_get_publisher_qos)\n",
+      publisher_id, topic_name);
+    ret = -EINVAL;
+    goto unlock_all;
+  }
+
+  args->ret_depth = pub_info->qos_depth;
+  args->ret_is_transient_local = pub_info->qos_is_transient_local;
+
+unlock_all:
+  up_read(&wrapper->topic_rwsem);
+unlock_only_global:
+  up_read(&global_htables_rwsem);
+  return ret;
+}
+
+static void remove_entry_node(struct topic_wrapper * wrapper, struct entry_node * en);
+
+int agnocast_ioctl_remove_subscriber(
+  const char * topic_name, const struct ipc_namespace * ipc_ns, topic_local_id_t subscriber_id)
+{
+  int ret = 0;
+
+  down_write(&global_htables_rwsem);
+
+  struct topic_wrapper * wrapper = find_topic(topic_name, ipc_ns);
+  if (!wrapper) {
+    ret = -EINVAL;
+    goto unlock;
+  }
+
+  struct subscriber_info * sub_info = find_subscriber_info(wrapper, subscriber_id);
+  if (!sub_info) {
+    ret = -ENODATA;
+    goto unlock;
+  }
+
+  hash_del(&sub_info->node);
+  kfree(sub_info->node_name);
+  kfree(sub_info);
+
+  dev_info(
+    agnocast_device, "Subscriber (id=%d) removed from topic %s.\n", subscriber_id, topic_name);
+
+  if (subscriber_id < 0 || subscriber_id >= MAX_TOPIC_LOCAL_ID) {
+    dev_warn(
+      agnocast_device,
+      "subscriber_id %d out of range [0, %d). (agnocast_ioctl_remove_subscriber)\n", subscriber_id,
+      MAX_TOPIC_LOCAL_ID);
+    ret = -EINVAL;
+    goto unlock;
+  }
+
+  struct rb_root * root = &wrapper->topic.entries;
+  struct rb_node * node = rb_first(root);
+
+  while (node) {
+    struct entry_node * en = rb_entry(node, struct entry_node, node);
+    node = rb_next(node);
+
+    // The subscriber may not have referenced this entry, so the bit may already be 0.
+    clear_bit(subscriber_id, en->referencing_subscribers);
+
+    if (is_referenced(en)) continue;
+
+    bool publisher_exited = false;
+    struct publisher_info * pub_info;
+    uint32_t hash_val = hash_min(en->publisher_id, PUB_INFO_HASH_BITS);
+    hash_for_each_possible(wrapper->topic.pub_info_htable, pub_info, node, hash_val)
+    {
+      if (pub_info->id == en->publisher_id) {
+        const struct process_info * proc_info = find_process_info(pub_info->pid);
+        if (!proc_info || proc_info->exited) {
+          publisher_exited = true;
+        }
+        break;
+      }
+    }
+    if (!publisher_exited) continue;
+
+    remove_entry_node(wrapper, en);
+
+    pub_info->entries_num--;
+    if (pub_info->entries_num == 0) {
+      hash_del(&pub_info->node);
+      kfree(pub_info->node_name);
+      kfree(pub_info);
+    }
+  }
+
+  if (get_size_pub_info_htable(wrapper) == 0 && get_size_sub_info_htable(wrapper) == 0) {
+    struct rb_node * n = rb_first(&wrapper->topic.entries);
+    while (n) {
+      struct entry_node * en = rb_entry(n, struct entry_node, node);
+      n = rb_next(n);
+      rb_erase(&en->node, &wrapper->topic.entries);
+      kfree(en);
+    }
+
+    hash_del(&wrapper->node);
+    kfree(wrapper->key);
+    kfree(wrapper);
+    dev_dbg(agnocast_device, "Topic %s removed (empty).\n", topic_name);
+  }
+
+unlock:
+  up_write(&global_htables_rwsem);
+  return ret;
+}
+
+int agnocast_ioctl_remove_publisher(
+  const char * topic_name, const struct ipc_namespace * ipc_ns, topic_local_id_t publisher_id)
+{
+  int ret = 0;
+
+  down_write(&global_htables_rwsem);
+
+  struct topic_wrapper * wrapper = find_topic(topic_name, ipc_ns);
+  if (!wrapper) {
+    ret = -EINVAL;
+    goto unlock;
+  }
+
+  struct publisher_info * pub_info = find_publisher_info(wrapper, publisher_id);
+  if (!pub_info) {
+    ret = -ENODATA;
+    goto unlock;
+  }
+
+  // Publisher-side handles do not participate in reference counting, so we don't need
+  // to remove publisher references. Just clean up entries that have no subscriber references.
+  struct rb_root * root = &wrapper->topic.entries;
+  struct rb_node * node = rb_first(root);
+  struct rb_node * next_node;
+
+  while (node) {
+    next_node = rb_next(node);
+    struct entry_node * en = rb_entry(node, struct entry_node, node);
+    node = next_node;
+
+    if (en->publisher_id != publisher_id) continue;
+
+    if (!is_referenced(en)) {
+      pub_info->entries_num--;
+      remove_entry_node(wrapper, en);
+    }
+  }
+
+  if (pub_info->entries_num == 0) {
+    hash_del(&pub_info->node);
+    kfree(pub_info->node_name);
+    kfree(pub_info);
+
+    dev_info(
+      agnocast_device, "Publisher (id=%d) removed from topic %s.\n", publisher_id, topic_name);
+  }
+
+  if (get_size_pub_info_htable(wrapper) == 0 && get_size_sub_info_htable(wrapper) == 0) {
+    struct rb_node * n = rb_first(&wrapper->topic.entries);
+    while (n) {
+      struct entry_node * en = rb_entry(n, struct entry_node, node);
+      n = rb_next(n);
+      remove_entry_node(wrapper, en);
+    }
+
+    hash_del(&wrapper->node);
+    kfree(wrapper->key);
+    kfree(wrapper);
+    dev_dbg(agnocast_device, "Topic %s removed (empty).\n", topic_name);
+  }
+
+unlock:
+  up_write(&global_htables_rwsem);
+  return ret;
+}
+
+static struct bridge_info * find_bridge_info(
+  const char * topic_name, const struct ipc_namespace * ipc_ns)
+{
+  struct bridge_info * br_info;
+  uint32_t hash_val = full_name_hash(NULL, topic_name, strlen(topic_name));
+  hash_for_each_possible(bridge_htable, br_info, node, hash_val)
+  {
+    if (ipc_ns == br_info->ipc_ns && strcmp(br_info->topic_name, topic_name) == 0) {
+      return br_info;
+    }
+  }
+  return NULL;
+}
+
+int agnocast_ioctl_add_bridge(
+  const char * topic_name, const pid_t pid, const bool is_r2a, const struct ipc_namespace * ipc_ns,
+  struct ioctl_add_bridge_args * ioctl_ret)
+{
+  int ret = 0;
+
+  down_write(&global_htables_rwsem);
+
+  struct bridge_info * existing = find_bridge_info(topic_name, ipc_ns);
+
+  if (existing) {
+    if (existing->pid != pid) {
+      ioctl_ret->ret_pid = existing->pid;
+      ioctl_ret->ret_has_r2a = existing->has_r2a;
+      ioctl_ret->ret_has_a2r = existing->has_a2r;
+      ret = -EEXIST;
+      goto unlock;
+    }
+
+    // pid matches
+    if (is_r2a) {
+      if (!existing->has_r2a) {
+        existing->has_r2a = true;
+        dev_info(
+          agnocast_device, "Bridge (topic=%s) r2a direction added for pid=%d.\n", topic_name, pid);
+      }
+    } else {
+      if (!existing->has_a2r) {
+        existing->has_a2r = true;
+        dev_info(
+          agnocast_device, "Bridge (topic=%s) a2r direction added for pid=%d.\n", topic_name, pid);
+      }
+    }
+
+    ioctl_ret->ret_pid = existing->pid;
+    ioctl_ret->ret_has_r2a = existing->has_r2a;
+    ioctl_ret->ret_has_a2r = existing->has_a2r;
+    goto unlock;
+  }
+
+  struct bridge_info * br_info = kmalloc(sizeof(*br_info), GFP_KERNEL);
+  if (!br_info) {
+    dev_warn(agnocast_device, "kmalloc failed. (ioctl_add_bridge)\n");
+    ret = -ENOMEM;
+    goto unlock;
+  }
+
+  br_info->topic_name = kstrdup(topic_name, GFP_KERNEL);
+  if (!br_info->topic_name) {
+    dev_warn(
+      agnocast_device, "Failed to add a new topic (topic_name=%s) by kstrdup. (ioctl_add_bridge)\n",
+      topic_name);
+    kfree(br_info);
+    ret = -ENOMEM;
+    goto unlock;
+  }
+
+  br_info->pid = pid;
+  br_info->ipc_ns = ipc_ns;
+
+  if (is_r2a) {
+    br_info->has_r2a = true;
+    br_info->has_a2r = false;
+  } else {
+    br_info->has_r2a = false;
+    br_info->has_a2r = true;
+  }
+
+  if (ioctl_ret) {
+    ioctl_ret->ret_pid = pid;
+    ioctl_ret->ret_has_r2a = br_info->has_r2a;
+    ioctl_ret->ret_has_a2r = br_info->has_a2r;
+  }
+
+  INIT_HLIST_NODE(&br_info->node);
+  uint32_t hash_val = full_name_hash(NULL, topic_name, strlen(topic_name));
+
+  hash_add(bridge_htable, &br_info->node, hash_val);
+
+  dev_info(
+    agnocast_device, "Bridge (topic=%s) added. pid=%d, r2a=%d, a2r=%d.\n", topic_name, pid,
+    br_info->has_r2a, br_info->has_a2r);
+
+unlock:
+  up_write(&global_htables_rwsem);
+  return ret;
+}
+
+int agnocast_ioctl_remove_bridge(
+  const char * topic_name, const pid_t pid, const bool is_r2a, const struct ipc_namespace * ipc_ns)
+{
+  int ret = 0;
+
+  down_write(&global_htables_rwsem);
+
+  struct bridge_info * br_info = find_bridge_info(topic_name, ipc_ns);
+
+  if (!br_info) {
+    dev_warn(
+      agnocast_device, "Bridge (topic=%s) not found. (agnocast_ioctl_remove_bridge)\n", topic_name);
+    ret = -ENOENT;
+    goto unlock;
+  }
+
+  if (br_info->pid != pid) {
+    dev_warn(
+      agnocast_device, "Bridge (topic=%s) pid mismatch. Expected %d, got %d.\n", topic_name,
+      br_info->pid, pid);
+    ret = -EPERM;
+    goto unlock;
+  }
+
+  if (is_r2a) {
+    if (!br_info->has_r2a) {
+      dev_warn(agnocast_device, "Bridge (topic=%s) r2a flag was already false.\n", topic_name);
+    }
+    br_info->has_r2a = false;
+  } else {
+    if (!br_info->has_a2r) {
+      dev_warn(agnocast_device, "Bridge (topic=%s) a2r flag was already false.\n", topic_name);
+    }
+    br_info->has_a2r = false;
+  }
+
+  if (!br_info->has_r2a && !br_info->has_a2r) {
+    hash_del(&br_info->node);
+    kfree(br_info->topic_name);
+    kfree(br_info);
+
+    dev_info(agnocast_device, "Bridge (topic=%s) removed completely.\n", topic_name);
+  } else {
+    dev_info(
+      agnocast_device, "Bridge (topic=%s) direction removed. Remaining: r2a=%d, a2r=%d.\n",
+      topic_name, br_info->has_r2a, br_info->has_a2r);
+  }
+
+unlock:
+  up_write(&global_htables_rwsem);
+  return ret;
+}
+
+static int get_process_num(const struct ipc_namespace * ipc_ns)
+{
+  int count = 0;
+  struct process_info * proc_info;
+  int bkt_proc_info;
+  hash_for_each(proc_info_htable, bkt_proc_info, proc_info, node)
+  {
+    if (ipc_eq(ipc_ns, proc_info->ipc_ns)) {
+      count++;
+    }
+  }
+  return count;
+}
+
+int agnocast_ioctl_notify_bridge_shutdown(const pid_t pid)
+{
+  down_write(&global_htables_rwsem);
+  struct process_info * proc_info = find_process_info(pid);
+  if (proc_info) {
+    // Unconditionally clear the flag; standard bridge managers also call this for consistency.
+    proc_info->is_performance_bridge_manager = false;
+  }
+  up_write(&global_htables_rwsem);
+  return 0;
+}
+
+int agnocast_ioctl_check_and_request_bridge_shutdown(
+  const pid_t pid, const struct ipc_namespace * ipc_ns,
+  struct ioctl_check_and_request_bridge_shutdown_args * ioctl_ret)
+{
+  down_write(&global_htables_rwsem);
+  // Request shutdown if there is no other process excluding poll_for_unlink.
+  if (get_process_num(ipc_ns) <= 1) {
+    struct process_info * proc_info = find_process_info(pid);
+    if (proc_info) {
+      proc_info->is_performance_bridge_manager = false;
+    }
+    ioctl_ret->ret_should_shutdown = true;
+  } else {
+    ioctl_ret->ret_should_shutdown = false;
+  }
+  up_write(&global_htables_rwsem);
   return 0;
 }
 
 static long agnocast_ioctl(struct file * file, unsigned int cmd, unsigned long arg)
 {
-  mutex_lock(&global_mutex);
   int ret = 0;
   const pid_t pid = current->tgid;
   const struct ipc_namespace * ipc_ns = current->nsproxy->ipc_ns;
 
   if (cmd == AGNOCAST_GET_VERSION_CMD) {
     struct ioctl_get_version_args get_version_args;
-    ret = get_version(&get_version_args);
+    memset(&get_version_args, 0, sizeof(get_version_args));
+    ret = agnocast_ioctl_get_version(&get_version_args);
     if (copy_to_user(
           (struct ioctl_get_version_args __user *)arg, &get_version_args, sizeof(get_version_args)))
-      goto return_EFAULT;
+      return -EFAULT;
   } else if (cmd == AGNOCAST_ADD_PROCESS_CMD) {
     union ioctl_add_process_args add_process_args;
     if (copy_from_user(
           &add_process_args, (union ioctl_add_process_args __user *)arg, sizeof(add_process_args)))
-      goto return_EFAULT;
-    ret = add_process(pid, ipc_ns, add_process_args.shm_size, &add_process_args);
-    if (copy_to_user(
-          (union ioctl_add_process_args __user *)arg, &add_process_args, sizeof(add_process_args)))
-      goto return_EFAULT;
+      return -EFAULT;
+    bool is_performance_bridge_manager = add_process_args.is_performance_bridge_manager;
+    ret = agnocast_ioctl_add_process(pid, ipc_ns, is_performance_bridge_manager, &add_process_args);
+    if (ret == 0) {
+      if (copy_to_user(
+            (union ioctl_add_process_args __user *)arg, &add_process_args,
+            sizeof(add_process_args)))
+        return -EFAULT;
+    }
   } else if (cmd == AGNOCAST_ADD_SUBSCRIBER_CMD) {
     union ioctl_add_subscriber_args sub_args;
     if (copy_from_user(&sub_args, (union ioctl_add_subscriber_args __user *)arg, sizeof(sub_args)))
-      goto return_EFAULT;
+      return -EFAULT;
     if (
       sub_args.topic_name.len >= TOPIC_NAME_BUFFER_SIZE ||
       sub_args.node_name.len >= NODE_NAME_BUFFER_SIZE)
-      goto return_EINVAL;
+      return -EINVAL;
     char * combined_buf = kmalloc(sub_args.topic_name.len + sub_args.node_name.len + 2, GFP_KERNEL);
-    if (!combined_buf) goto return_ENOMEM;
+    if (!combined_buf) return -ENOMEM;
     char * topic_name_buf = combined_buf;
     char * node_name_buf = combined_buf + sub_args.topic_name.len + 1;
     if (copy_from_user(
           topic_name_buf, (char __user *)sub_args.topic_name.ptr, sub_args.topic_name.len)) {
       kfree(combined_buf);
-      goto return_EFAULT;
+      return -EFAULT;
     }
     topic_name_buf[sub_args.topic_name.len] = '\0';
     if (copy_from_user(
           node_name_buf, (char __user *)sub_args.node_name.ptr, sub_args.node_name.len)) {
       kfree(combined_buf);
-      goto return_EFAULT;
+      return -EFAULT;
     }
     node_name_buf[sub_args.node_name.len] = '\0';
-    ret = add_subscriber(
+    ret = agnocast_ioctl_add_subscriber(
       topic_name_buf, ipc_ns, node_name_buf, pid, sub_args.qos_depth,
-      sub_args.qos_is_transient_local, sub_args.is_take_sub, &sub_args);
+      sub_args.qos_is_transient_local, sub_args.qos_is_reliable, sub_args.is_take_sub,
+      sub_args.ignore_local_publications, sub_args.is_bridge, &sub_args);
     kfree(combined_buf);
-    if (copy_to_user((union ioctl_add_subscriber_args __user *)arg, &sub_args, sizeof(sub_args)))
-      goto return_EFAULT;
+    if (ret == 0) {
+      if (copy_to_user((union ioctl_add_subscriber_args __user *)arg, &sub_args, sizeof(sub_args)))
+        return -EFAULT;
+    }
   } else if (cmd == AGNOCAST_ADD_PUBLISHER_CMD) {
     union ioctl_add_publisher_args pub_args;
     if (copy_from_user(&pub_args, (union ioctl_add_publisher_args __user *)arg, sizeof(pub_args)))
-      goto return_EFAULT;
+      return -EFAULT;
     if (
       pub_args.topic_name.len >= TOPIC_NAME_BUFFER_SIZE ||
       pub_args.node_name.len >= NODE_NAME_BUFFER_SIZE)
-      goto return_EINVAL;
+      return -EINVAL;
     char * combined_buf = kmalloc(pub_args.topic_name.len + pub_args.node_name.len + 2, GFP_KERNEL);
-    if (!combined_buf) goto return_ENOMEM;
+    if (!combined_buf) return -ENOMEM;
     char * topic_name_buf = combined_buf;
     char * node_name_buf = combined_buf + pub_args.topic_name.len + 1;
     if (copy_from_user(
           topic_name_buf, (char __user *)pub_args.topic_name.ptr, pub_args.topic_name.len)) {
       kfree(combined_buf);
-      goto return_EFAULT;
+      return -EFAULT;
     }
     topic_name_buf[pub_args.topic_name.len] = '\0';
     if (copy_from_user(
           node_name_buf, (char __user *)pub_args.node_name.ptr, pub_args.node_name.len)) {
       kfree(combined_buf);
-      goto return_EFAULT;
+      return -EFAULT;
     }
     node_name_buf[pub_args.node_name.len] = '\0';
-    ret = add_publisher(
+    ret = agnocast_ioctl_add_publisher(
       topic_name_buf, ipc_ns, node_name_buf, pid, pub_args.qos_depth,
-      pub_args.qos_is_transient_local, &pub_args);
+      pub_args.qos_is_transient_local, pub_args.is_bridge, &pub_args);
     kfree(combined_buf);
-    if (copy_to_user((union ioctl_add_publisher_args __user *)arg, &pub_args, sizeof(pub_args)))
-      goto return_EFAULT;
-  } else if (cmd == AGNOCAST_INCREMENT_RC_CMD) {
+    if (ret == 0) {
+      if (copy_to_user((union ioctl_add_publisher_args __user *)arg, &pub_args, sizeof(pub_args)))
+        return -EFAULT;
+    }
+  } else if (cmd == AGNOCAST_RELEASE_SUB_REF_CMD) {
     struct ioctl_update_entry_args entry_args;
     if (copy_from_user(
           &entry_args, (struct ioctl_update_entry_args __user *)arg, sizeof(entry_args)))
-      goto return_EFAULT;
-    if (entry_args.topic_name.len >= TOPIC_NAME_BUFFER_SIZE) goto return_EINVAL;
+      return -EFAULT;
+    if (entry_args.topic_name.len >= TOPIC_NAME_BUFFER_SIZE) return -EINVAL;
     char * topic_name_buf = kmalloc(entry_args.topic_name.len + 1, GFP_KERNEL);
-    if (!topic_name_buf) goto return_ENOMEM;
+    if (!topic_name_buf) return -ENOMEM;
     if (copy_from_user(
           topic_name_buf, (char __user *)entry_args.topic_name.ptr, entry_args.topic_name.len)) {
       kfree(topic_name_buf);
-      goto return_EFAULT;
+      return -EFAULT;
     }
     topic_name_buf[entry_args.topic_name.len] = '\0';
-    ret =
-      increment_message_entry_rc(topic_name_buf, ipc_ns, entry_args.pubsub_id, entry_args.entry_id);
-    kfree(topic_name_buf);
-  } else if (cmd == AGNOCAST_DECREMENT_RC_CMD) {
-    struct ioctl_update_entry_args entry_args;
-    if (copy_from_user(
-          &entry_args, (struct ioctl_update_entry_args __user *)arg, sizeof(entry_args)))
-      goto return_EFAULT;
-    if (entry_args.topic_name.len >= TOPIC_NAME_BUFFER_SIZE) goto return_EINVAL;
-    char * topic_name_buf = kmalloc(entry_args.topic_name.len + 1, GFP_KERNEL);
-    if (!topic_name_buf) goto return_ENOMEM;
-    if (copy_from_user(
-          topic_name_buf, (char __user *)entry_args.topic_name.ptr, entry_args.topic_name.len)) {
-      kfree(topic_name_buf);
-      goto return_EFAULT;
-    }
-    topic_name_buf[entry_args.topic_name.len] = '\0';
-    ret =
-      decrement_message_entry_rc(topic_name_buf, ipc_ns, entry_args.pubsub_id, entry_args.entry_id);
+    ret = agnocast_ioctl_release_message_entry_reference(
+      topic_name_buf, ipc_ns, entry_args.pubsub_id, entry_args.entry_id);
     kfree(topic_name_buf);
   } else if (cmd == AGNOCAST_RECEIVE_MSG_CMD) {
     union ioctl_receive_msg_args receive_msg_args;
     if (copy_from_user(
           &receive_msg_args, (union ioctl_receive_msg_args __user *)arg, sizeof(receive_msg_args)))
-      goto return_EFAULT;
-    if (receive_msg_args.topic_name.len >= TOPIC_NAME_BUFFER_SIZE) goto return_EINVAL;
+      return -EFAULT;
+    if (receive_msg_args.topic_name.len >= TOPIC_NAME_BUFFER_SIZE) return -EINVAL;
     char * topic_name_buf = kmalloc(receive_msg_args.topic_name.len + 1, GFP_KERNEL);
-    if (!topic_name_buf) goto return_ENOMEM;
+    if (!topic_name_buf) return -ENOMEM;
     if (copy_from_user(
           topic_name_buf, (char __user *)receive_msg_args.topic_name.ptr,
           receive_msg_args.topic_name.len)) {
       kfree(topic_name_buf);
-      goto return_EFAULT;
+      return -EFAULT;
     }
     topic_name_buf[receive_msg_args.topic_name.len] = '\0';
-    ret = receive_msg(topic_name_buf, ipc_ns, receive_msg_args.subscriber_id, &receive_msg_args);
+
+    uint64_t pub_shm_info_addr = receive_msg_args.pub_shm_info_addr;
+    uint32_t pub_shm_info_size = receive_msg_args.pub_shm_info_size;
+    if (pub_shm_info_size > MAX_PUBLISHER_NUM) {
+      kfree(topic_name_buf);
+      return -EINVAL;
+    }
+
+    struct publisher_shm_info * pub_shm_infos =
+      kcalloc(pub_shm_info_size, sizeof(struct publisher_shm_info), GFP_KERNEL);
+    if (!pub_shm_infos) {
+      kfree(topic_name_buf);
+      return -ENOMEM;
+    }
+
+    ret = agnocast_ioctl_receive_msg(
+      topic_name_buf, ipc_ns, receive_msg_args.subscriber_id, pub_shm_infos, pub_shm_info_size,
+      &receive_msg_args);
     kfree(topic_name_buf);
-    if (copy_to_user(
-          (union ioctl_receive_msg_args __user *)arg, &receive_msg_args, sizeof(receive_msg_args)))
-      goto return_EFAULT;
+
+    if (ret == 0 && receive_msg_args.ret_pub_shm_num > 0) {
+      if (copy_to_user(
+            (struct publisher_shm_info __user *)pub_shm_info_addr, pub_shm_infos,
+            receive_msg_args.ret_pub_shm_num * sizeof(struct publisher_shm_info))) {
+        kfree(pub_shm_infos);
+        return -EFAULT;
+      }
+    }
+    kfree(pub_shm_infos);
+
+    if (ret == 0) {
+      if (copy_to_user(
+            (union ioctl_receive_msg_args __user *)arg, &receive_msg_args,
+            sizeof(receive_msg_args)))
+        return -EFAULT;
+    }
   } else if (cmd == AGNOCAST_PUBLISH_MSG_CMD) {
     union ioctl_publish_msg_args publish_msg_args;
     if (copy_from_user(
           &publish_msg_args, (union ioctl_publish_msg_args __user *)arg, sizeof(publish_msg_args)))
-      goto return_EFAULT;
-    if (publish_msg_args.topic_name.len >= TOPIC_NAME_BUFFER_SIZE) goto return_EINVAL;
+      return -EFAULT;
+    if (publish_msg_args.topic_name.len >= TOPIC_NAME_BUFFER_SIZE) return -EINVAL;
     char * topic_name_buf = kmalloc(publish_msg_args.topic_name.len + 1, GFP_KERNEL);
-    if (!topic_name_buf) goto return_ENOMEM;
+    if (!topic_name_buf) return -ENOMEM;
     if (copy_from_user(
           topic_name_buf, (char __user *)publish_msg_args.topic_name.ptr,
           publish_msg_args.topic_name.len)) {
       kfree(topic_name_buf);
-      goto return_EFAULT;
+      return -EFAULT;
     }
     topic_name_buf[publish_msg_args.topic_name.len] = '\0';
-    ret = publish_msg(
+
+    // Allocate kernel buffer for subscriber IDs
+    uint32_t buffer_size = publish_msg_args.subscriber_ids_buffer_size;
+    if (buffer_size != MAX_SUBSCRIBER_NUM) {
+      kfree(topic_name_buf);
+      return -EINVAL;
+    }
+    topic_local_id_t * subscriber_ids_buf =
+      kcalloc(buffer_size, sizeof(topic_local_id_t), GFP_KERNEL);
+    if (!subscriber_ids_buf) {
+      kfree(topic_name_buf);
+      return -ENOMEM;
+    }
+
+    uint64_t subscriber_ids_buffer_addr = publish_msg_args.subscriber_ids_buffer_addr;
+
+    ret = agnocast_ioctl_publish_msg(
       topic_name_buf, ipc_ns, publish_msg_args.publisher_id, publish_msg_args.msg_virtual_address,
-      &publish_msg_args);
+      subscriber_ids_buf, buffer_size, &publish_msg_args);
     kfree(topic_name_buf);
-    if (copy_to_user(
-          (union ioctl_publish_msg_args __user *)arg, &publish_msg_args, sizeof(publish_msg_args)))
-      goto return_EFAULT;
+
+    if (ret == 0) {
+      // Copy subscriber IDs to user-space buffer
+      uint32_t copy_count = min(publish_msg_args.ret_subscriber_num, buffer_size);
+      if (copy_count > 0) {
+        if (copy_to_user(
+              (topic_local_id_t __user *)subscriber_ids_buffer_addr, subscriber_ids_buf,
+              copy_count * sizeof(topic_local_id_t))) {
+          kfree(subscriber_ids_buf);
+          return -EFAULT;
+        }
+      }
+    }
+    kfree(subscriber_ids_buf);
+
+    if (ret == 0) {
+      if (copy_to_user(
+            (union ioctl_publish_msg_args __user *)arg, &publish_msg_args,
+            sizeof(publish_msg_args)))
+        return -EFAULT;
+    }
   } else if (cmd == AGNOCAST_TAKE_MSG_CMD) {
     union ioctl_take_msg_args take_args;
     if (copy_from_user(&take_args, (union ioctl_take_msg_args __user *)arg, sizeof(take_args)))
-      goto return_EFAULT;
-    if (take_args.topic_name.len >= TOPIC_NAME_BUFFER_SIZE) goto return_EINVAL;
+      return -EFAULT;
+    if (take_args.topic_name.len >= TOPIC_NAME_BUFFER_SIZE) return -EINVAL;
     char * topic_name_buf = kmalloc(take_args.topic_name.len + 1, GFP_KERNEL);
-    if (!topic_name_buf) goto return_ENOMEM;
+    if (!topic_name_buf) return -ENOMEM;
     if (copy_from_user(
           topic_name_buf, (char __user *)take_args.topic_name.ptr, take_args.topic_name.len)) {
       kfree(topic_name_buf);
-      goto return_EFAULT;
+      return -EFAULT;
     }
     topic_name_buf[take_args.topic_name.len] = '\0';
-    ret = take_msg(
-      topic_name_buf, ipc_ns, take_args.subscriber_id, take_args.allow_same_message, &take_args);
+
+    uint64_t pub_shm_info_addr = take_args.pub_shm_info_addr;
+    uint32_t pub_shm_info_size = take_args.pub_shm_info_size;
+    if (pub_shm_info_size > MAX_PUBLISHER_NUM) {
+      kfree(topic_name_buf);
+      return -EINVAL;
+    }
+
+    struct publisher_shm_info * pub_shm_infos =
+      kcalloc(pub_shm_info_size, sizeof(struct publisher_shm_info), GFP_KERNEL);
+    if (!pub_shm_infos) {
+      kfree(topic_name_buf);
+      return -ENOMEM;
+    }
+
+    ret = agnocast_ioctl_take_msg(
+      topic_name_buf, ipc_ns, take_args.subscriber_id, take_args.allow_same_message, pub_shm_infos,
+      pub_shm_info_size, &take_args);
     kfree(topic_name_buf);
-    if (copy_to_user((union ioctl_take_msg_args __user *)arg, &take_args, sizeof(take_args)))
-      goto return_EFAULT;
+
+    if (ret == 0 && take_args.ret_pub_shm_num > 0) {
+      if (copy_to_user(
+            (struct publisher_shm_info __user *)pub_shm_info_addr, pub_shm_infos,
+            take_args.ret_pub_shm_num * sizeof(struct publisher_shm_info))) {
+        kfree(pub_shm_infos);
+        return -EFAULT;
+      }
+    }
+    kfree(pub_shm_infos);
+
+    if (ret == 0) {
+      if (copy_to_user((union ioctl_take_msg_args __user *)arg, &take_args, sizeof(take_args)))
+        return -EFAULT;
+    }
   } else if (cmd == AGNOCAST_GET_SUBSCRIBER_NUM_CMD) {
     union ioctl_get_subscriber_num_args get_subscriber_num_args;
     if (copy_from_user(
           &get_subscriber_num_args, (union ioctl_get_subscriber_num_args __user *)arg,
           sizeof(get_subscriber_num_args)))
-      goto return_EFAULT;
-    if (get_subscriber_num_args.topic_name.len >= TOPIC_NAME_BUFFER_SIZE) goto return_EINVAL;
+      return -EFAULT;
+    if (get_subscriber_num_args.topic_name.len >= TOPIC_NAME_BUFFER_SIZE) return -EINVAL;
     char * topic_name_buf = kmalloc(get_subscriber_num_args.topic_name.len + 1, GFP_KERNEL);
-    if (!topic_name_buf) goto return_ENOMEM;
+    if (!topic_name_buf) return -ENOMEM;
     if (copy_from_user(
           topic_name_buf, (char __user *)get_subscriber_num_args.topic_name.ptr,
           get_subscriber_num_args.topic_name.len)) {
       kfree(topic_name_buf);
-      goto return_EFAULT;
+      return -EFAULT;
     }
     topic_name_buf[get_subscriber_num_args.topic_name.len] = '\0';
-    ret = get_subscriber_num(topic_name_buf, ipc_ns, &get_subscriber_num_args);
+    ret = agnocast_ioctl_get_subscriber_num(topic_name_buf, ipc_ns, pid, &get_subscriber_num_args);
     kfree(topic_name_buf);
     if (copy_to_user(
           (union ioctl_get_subscriber_num_args __user *)arg, &get_subscriber_num_args,
           sizeof(get_subscriber_num_args)))
-      goto return_EFAULT;
+      return -EFAULT;
+  } else if (cmd == AGNOCAST_GET_PUBLISHER_NUM_CMD) {
+    union ioctl_get_publisher_num_args get_publisher_num_args;
+    if (copy_from_user(
+          &get_publisher_num_args, (union ioctl_get_publisher_num_args __user *)arg,
+          sizeof(get_publisher_num_args)))
+      return -EFAULT;
+    if (get_publisher_num_args.topic_name.len >= TOPIC_NAME_BUFFER_SIZE) return -EINVAL;
+    char * topic_name_buf = kmalloc(get_publisher_num_args.topic_name.len + 1, GFP_KERNEL);
+    if (!topic_name_buf) return -ENOMEM;
+    if (copy_from_user(
+          topic_name_buf, (char __user *)get_publisher_num_args.topic_name.ptr,
+          get_publisher_num_args.topic_name.len)) {
+      kfree(topic_name_buf);
+      return -EFAULT;
+    }
+    topic_name_buf[get_publisher_num_args.topic_name.len] = '\0';
+    ret = agnocast_ioctl_get_publisher_num(topic_name_buf, ipc_ns, &get_publisher_num_args);
+    kfree(topic_name_buf);
+    if (copy_to_user(
+          (union ioctl_get_publisher_num_args __user *)arg, &get_publisher_num_args,
+          sizeof(get_publisher_num_args)))
+      return -EFAULT;
   } else if (cmd == AGNOCAST_GET_EXIT_PROCESS_CMD) {
     struct ioctl_get_exit_process_args get_exit_process_args;
-    ret = get_exit_process(ipc_ns, &get_exit_process_args);
+    if (copy_from_user(
+          &get_exit_process_args, (struct ioctl_get_exit_process_args __user *)arg,
+          sizeof(get_exit_process_args)))
+      return -EFAULT;
+
+    uint32_t mq_buf_size = get_exit_process_args.subscription_mq_info_buffer_size;
+    if (mq_buf_size > MAX_SUBSCRIPTION_NUM_PER_PROCESS) return -EINVAL;
+
+    uint64_t mq_buf_addr = get_exit_process_args.subscription_mq_info_buffer_addr;
+    if (mq_buf_size > 0 && mq_buf_addr == 0) return -EINVAL;
+
+    struct exit_subscription_mq_info * mq_info_buf = NULL;
+    if (mq_buf_size > 0) {
+      mq_info_buf = kvcalloc(mq_buf_size, sizeof(*mq_info_buf), GFP_KERNEL);
+      if (!mq_info_buf) return -ENOMEM;
+    }
+
+    pid_t global_pid = -1;
+    agnocast_ioctl_get_exit_process(
+      ipc_ns, &get_exit_process_args, mq_info_buf, mq_buf_size, &global_pid);
+
+    // Copy subscription MQ info to user-space. On failure, entries remain in the kernel
+    // for the next poll (agnocast_commit_exit_process is not called).
+    if (get_exit_process_args.ret_subscription_mq_info_num > 0 && mq_info_buf) {
+      uint32_t copy_count = get_exit_process_args.ret_subscription_mq_info_num;
+      if (copy_to_user(
+            (struct exit_subscription_mq_info __user *)mq_buf_addr, mq_info_buf,
+            copy_count * sizeof(struct exit_subscription_mq_info))) {
+        kvfree(mq_info_buf);
+        return -EFAULT;
+      }
+    }
+    kvfree(mq_info_buf);
+
+    // Copy ret_pid and ret_subscription_mq_info_num to user-space BEFORE commit.
+    // ret_daemon_should_exit is not yet known and will be patched after commit.
     if (copy_to_user(
           (struct ioctl_get_exit_process_args __user *)arg, &get_exit_process_args,
           sizeof(get_exit_process_args)))
-      goto return_EFAULT;
+      return -EFAULT;
+
+    // Commit: delete copied entries and free proc_info. Safe because user-space already
+    // has ret_pid and ret_subscription_mq_info_num — entries cannot be permanently lost.
+    bool daemon_should_exit = false;
+    agnocast_commit_exit_process(
+      ipc_ns, global_pid, get_exit_process_args.ret_subscription_mq_info_num, &daemon_should_exit);
+
+    // Patch ret_daemon_should_exit in user-space. If this fails, the daemon simply stays
+    // alive one extra poll cycle — no resource leak.
+    if (copy_to_user(
+          &((struct ioctl_get_exit_process_args __user *)arg)->ret_daemon_should_exit,
+          &daemon_should_exit, sizeof(daemon_should_exit)))
+      return -EFAULT;
   } else if (cmd == AGNOCAST_GET_TOPIC_LIST_CMD) {
     union ioctl_topic_list_args topic_list_args;
     if (copy_from_user(
           &topic_list_args, (union ioctl_topic_list_args __user *)arg, sizeof(topic_list_args)))
-      goto return_EFAULT;
-    ret = get_topic_list(ipc_ns, &topic_list_args);
-    if (copy_to_user(
-          (union ioctl_topic_list_args __user *)arg, &topic_list_args, sizeof(topic_list_args)))
-      goto return_EFAULT;
+      return -EFAULT;
+    ret = agnocast_ioctl_get_topic_list(ipc_ns, &topic_list_args);
+    if (ret == 0) {
+      if (copy_to_user(
+            (union ioctl_topic_list_args __user *)arg, &topic_list_args, sizeof(topic_list_args)))
+        return -EFAULT;
+    }
   } else if (cmd == AGNOCAST_GET_NODE_SUBSCRIBER_TOPICS_CMD) {
     union ioctl_node_info_args node_info_sub_args;
     if (copy_from_user(
           &node_info_sub_args, (union ioctl_node_info_args __user *)arg,
           sizeof(node_info_sub_args)))
-      goto return_EFAULT;
-    if (node_info_sub_args.node_name.len >= NODE_NAME_BUFFER_SIZE) goto return_EINVAL;
+      return -EFAULT;
+    if (node_info_sub_args.node_name.len >= NODE_NAME_BUFFER_SIZE) return -EINVAL;
     char * node_name_buf = kmalloc(node_info_sub_args.node_name.len + 1, GFP_KERNEL);
-    if (!node_name_buf) goto return_ENOMEM;
+    if (!node_name_buf) return -ENOMEM;
     if (copy_from_user(
           node_name_buf, (char __user *)node_info_sub_args.node_name.ptr,
           node_info_sub_args.node_name.len)) {
       kfree(node_name_buf);
-      goto return_EFAULT;
+      return -EFAULT;
     }
     node_name_buf[node_info_sub_args.node_name.len] = '\0';
-    ret = get_node_subscriber_topics(ipc_ns, node_name_buf, &node_info_sub_args);
+    ret = agnocast_ioctl_get_node_subscriber_topics(ipc_ns, node_name_buf, &node_info_sub_args);
     kfree(node_name_buf);
-    if (copy_to_user(
-          (union ioctl_node_info_args __user *)arg, &node_info_sub_args,
-          sizeof(node_info_sub_args)))
-      goto return_EFAULT;
+    if (ret == 0) {
+      if (copy_to_user(
+            (union ioctl_node_info_args __user *)arg, &node_info_sub_args,
+            sizeof(node_info_sub_args)))
+        return -EFAULT;
+    }
   } else if (cmd == AGNOCAST_GET_NODE_PUBLISHER_TOPICS_CMD) {
     union ioctl_node_info_args node_info_pub_args;
     if (copy_from_user(
           &node_info_pub_args, (union ioctl_node_info_args __user *)arg,
           sizeof(node_info_pub_args)))
-      goto return_EFAULT;
-    if (node_info_pub_args.node_name.len >= NODE_NAME_BUFFER_SIZE) goto return_EINVAL;
+      return -EFAULT;
+    if (node_info_pub_args.node_name.len >= NODE_NAME_BUFFER_SIZE) return -EINVAL;
     char * node_name_buf = kmalloc(node_info_pub_args.node_name.len + 1, GFP_KERNEL);
-    if (!node_name_buf) goto return_ENOMEM;
+    if (!node_name_buf) return -ENOMEM;
     if (copy_from_user(
           node_name_buf, (char __user *)node_info_pub_args.node_name.ptr,
           node_info_pub_args.node_name.len)) {
       kfree(node_name_buf);
-      goto return_EFAULT;
+      return -EFAULT;
     }
     node_name_buf[node_info_pub_args.node_name.len] = '\0';
-    ret = get_node_publisher_topics(ipc_ns, node_name_buf, &node_info_pub_args);
+    ret = agnocast_ioctl_get_node_publisher_topics(ipc_ns, node_name_buf, &node_info_pub_args);
     kfree(node_name_buf);
-    if (copy_to_user(
-          (union ioctl_node_info_args __user *)arg, &node_info_pub_args,
-          sizeof(node_info_pub_args)))
-      goto return_EFAULT;
+    if (ret == 0) {
+      if (copy_to_user(
+            (union ioctl_node_info_args __user *)arg, &node_info_pub_args,
+            sizeof(node_info_pub_args)))
+        return -EFAULT;
+    }
   } else if (cmd == AGNOCAST_GET_TOPIC_SUBSCRIBER_INFO_CMD) {
     union ioctl_topic_info_args topic_info_sub_args;
     if (copy_from_user(
           &topic_info_sub_args, (union ioctl_topic_info_args __user *)arg,
           sizeof(topic_info_sub_args)))
-      goto return_EFAULT;
-    if (topic_info_sub_args.topic_name.len >= TOPIC_NAME_BUFFER_SIZE) goto return_EINVAL;
+      return -EFAULT;
+    if (topic_info_sub_args.topic_name.len >= TOPIC_NAME_BUFFER_SIZE) return -EINVAL;
     char * topic_name_buf = kmalloc(topic_info_sub_args.topic_name.len + 1, GFP_KERNEL);
-    if (!topic_name_buf) goto return_ENOMEM;
+    if (!topic_name_buf) return -ENOMEM;
     if (copy_from_user(
           topic_name_buf, (char __user *)topic_info_sub_args.topic_name.ptr,
           topic_info_sub_args.topic_name.len)) {
       kfree(topic_name_buf);
-      goto return_EFAULT;
+      return -EFAULT;
     }
     topic_name_buf[topic_info_sub_args.topic_name.len] = '\0';
-    ret = get_topic_subscriber_info(topic_name_buf, ipc_ns, &topic_info_sub_args);
+    ret = agnocast_ioctl_get_topic_subscriber_info(topic_name_buf, ipc_ns, &topic_info_sub_args);
     kfree(topic_name_buf);
-    if (copy_to_user(
-          (union ioctl_topic_info_args __user *)arg, &topic_info_sub_args,
-          sizeof(topic_info_sub_args)))
-      goto return_EFAULT;
+    if (ret == 0) {
+      if (copy_to_user(
+            (union ioctl_topic_info_args __user *)arg, &topic_info_sub_args,
+            sizeof(topic_info_sub_args)))
+        return -EFAULT;
+    }
   } else if (cmd == AGNOCAST_GET_TOPIC_PUBLISHER_INFO_CMD) {
     union ioctl_topic_info_args topic_info_pub_args;
     if (copy_from_user(
           &topic_info_pub_args, (union ioctl_topic_info_args __user *)arg,
           sizeof(topic_info_pub_args)))
-      goto return_EFAULT;
+      return -EFAULT;
+    if (topic_info_pub_args.topic_name.len >= TOPIC_NAME_BUFFER_SIZE) return -EINVAL;
     char * topic_name_buf = kmalloc(topic_info_pub_args.topic_name.len + 1, GFP_KERNEL);
-    if (!topic_name_buf) goto return_ENOMEM;
+    if (!topic_name_buf) return -ENOMEM;
     if (copy_from_user(
           topic_name_buf, (char __user *)topic_info_pub_args.topic_name.ptr,
           topic_info_pub_args.topic_name.len)) {
       kfree(topic_name_buf);
-      goto return_EFAULT;
+      return -EFAULT;
     }
     topic_name_buf[topic_info_pub_args.topic_name.len] = '\0';
-    ret = get_topic_publisher_info(topic_name_buf, ipc_ns, &topic_info_pub_args);
+    ret = agnocast_ioctl_get_topic_publisher_info(topic_name_buf, ipc_ns, &topic_info_pub_args);
     kfree(topic_name_buf);
+    if (ret == 0) {
+      if (copy_to_user(
+            (union ioctl_topic_info_args __user *)arg, &topic_info_pub_args,
+            sizeof(topic_info_pub_args)))
+        return -EFAULT;
+    }
+  } else if (cmd == AGNOCAST_GET_SUBSCRIBER_QOS_CMD) {
+    struct ioctl_get_subscriber_qos_args get_sub_qos_args;
+    if (copy_from_user(
+          &get_sub_qos_args, (struct ioctl_get_subscriber_qos_args __user *)arg,
+          sizeof(get_sub_qos_args)))
+      return -EFAULT;
+    if (get_sub_qos_args.topic_name.len >= TOPIC_NAME_BUFFER_SIZE) return -EINVAL;
+    char * topic_name_buf = kmalloc(get_sub_qos_args.topic_name.len + 1, GFP_KERNEL);
+    if (!topic_name_buf) return -ENOMEM;
+    if (copy_from_user(
+          topic_name_buf, (char __user *)get_sub_qos_args.topic_name.ptr,
+          get_sub_qos_args.topic_name.len)) {
+      kfree(topic_name_buf);
+      return -EFAULT;
+    }
+    topic_name_buf[get_sub_qos_args.topic_name.len] = '\0';
+    ret = agnocast_ioctl_get_subscriber_qos(
+      topic_name_buf, ipc_ns, get_sub_qos_args.subscriber_id, &get_sub_qos_args);
+    kfree(topic_name_buf);
+    if (ret == 0) {
+      if (copy_to_user(
+            (struct ioctl_get_subscriber_qos_args __user *)arg, &get_sub_qos_args,
+            sizeof(get_sub_qos_args)))
+        return -EFAULT;
+    }
+  } else if (cmd == AGNOCAST_GET_PUBLISHER_QOS_CMD) {
+    struct ioctl_get_publisher_qos_args get_pub_qos_args;
+    if (copy_from_user(
+          &get_pub_qos_args, (struct ioctl_get_publisher_qos_args __user *)arg,
+          sizeof(get_pub_qos_args)))
+      return -EFAULT;
+    if (get_pub_qos_args.topic_name.len >= TOPIC_NAME_BUFFER_SIZE) return -EINVAL;
+    char * topic_name_buf = kmalloc(get_pub_qos_args.topic_name.len + 1, GFP_KERNEL);
+    if (!topic_name_buf) return -ENOMEM;
+    if (copy_from_user(
+          topic_name_buf, (char __user *)get_pub_qos_args.topic_name.ptr,
+          get_pub_qos_args.topic_name.len)) {
+      kfree(topic_name_buf);
+      return -EFAULT;
+    }
+    topic_name_buf[get_pub_qos_args.topic_name.len] = '\0';
+    ret = agnocast_ioctl_get_publisher_qos(
+      topic_name_buf, ipc_ns, get_pub_qos_args.publisher_id, &get_pub_qos_args);
+    kfree(topic_name_buf);
+    if (ret == 0) {
+      if (copy_to_user(
+            (struct ioctl_get_publisher_qos_args __user *)arg, &get_pub_qos_args,
+            sizeof(get_pub_qos_args)))
+        return -EFAULT;
+    }
+  } else if (cmd == AGNOCAST_REMOVE_SUBSCRIBER_CMD) {
+    struct ioctl_remove_subscriber_args remove_subscriber_args;
+    if (copy_from_user(
+          &remove_subscriber_args, (void __user *)arg, sizeof(remove_subscriber_args))) {
+      return -EFAULT;
+    }
+    if (remove_subscriber_args.topic_name.len >= TOPIC_NAME_BUFFER_SIZE) return -EINVAL;
+    char * topic_name_buf = kmalloc(remove_subscriber_args.topic_name.len + 1, GFP_KERNEL);
+    if (!topic_name_buf) return -ENOMEM;
+    if (copy_from_user(
+          topic_name_buf, (char __user *)remove_subscriber_args.topic_name.ptr,
+          remove_subscriber_args.topic_name.len)) {
+      kfree(topic_name_buf);
+      return -EFAULT;
+    }
+    topic_name_buf[remove_subscriber_args.topic_name.len] = '\0';
+    ret = agnocast_ioctl_remove_subscriber(
+      topic_name_buf, ipc_ns, remove_subscriber_args.subscriber_id);
+    kfree(topic_name_buf);
+  } else if (cmd == AGNOCAST_REMOVE_PUBLISHER_CMD) {
+    struct ioctl_remove_publisher_args remove_publisher_args;
+    if (copy_from_user(&remove_publisher_args, (void __user *)arg, sizeof(remove_publisher_args))) {
+      return -EFAULT;
+    }
+    if (remove_publisher_args.topic_name.len >= TOPIC_NAME_BUFFER_SIZE) return -EINVAL;
+    char * topic_name_buf = kmalloc(remove_publisher_args.topic_name.len + 1, GFP_KERNEL);
+    if (!topic_name_buf) return -ENOMEM;
+    if (copy_from_user(
+          topic_name_buf, (char __user *)remove_publisher_args.topic_name.ptr,
+          remove_publisher_args.topic_name.len)) {
+      kfree(topic_name_buf);
+      return -EFAULT;
+    }
+    topic_name_buf[remove_publisher_args.topic_name.len] = '\0';
+    ret =
+      agnocast_ioctl_remove_publisher(topic_name_buf, ipc_ns, remove_publisher_args.publisher_id);
+    kfree(topic_name_buf);
+  } else if (cmd == AGNOCAST_ADD_BRIDGE_CMD) {
+    struct ioctl_add_bridge_args bridge_args;
+    if (copy_from_user(&bridge_args, (void __user *)arg, sizeof(bridge_args))) return -EFAULT;
+    if (bridge_args.topic_name.len >= TOPIC_NAME_BUFFER_SIZE) return -EINVAL;
+    char * topic_name_buf = kmalloc(bridge_args.topic_name.len + 1, GFP_KERNEL);
+    if (!topic_name_buf) return -ENOMEM;
+    if (copy_from_user(
+          topic_name_buf, (char __user *)bridge_args.topic_name.ptr, bridge_args.topic_name.len)) {
+      kfree(topic_name_buf);
+      return -EFAULT;
+    }
+    topic_name_buf[bridge_args.topic_name.len] = '\0';
+    ret = agnocast_ioctl_add_bridge(topic_name_buf, pid, bridge_args.is_r2a, ipc_ns, &bridge_args);
+    kfree(topic_name_buf);
+    if (ret == 0 || ret == -EEXIST) {
+      if (copy_to_user(
+            (struct ioctl_add_bridge_args __user *)arg, &bridge_args, sizeof(bridge_args)))
+        return -EFAULT;
+    }
+  } else if (cmd == AGNOCAST_REMOVE_BRIDGE_CMD) {
+    struct ioctl_remove_bridge_args remove_bridge_args;
+    if (copy_from_user(&remove_bridge_args, (void __user *)arg, sizeof(remove_bridge_args)))
+      return -EFAULT;
+    if (remove_bridge_args.topic_name.len >= TOPIC_NAME_BUFFER_SIZE) return -EINVAL;
+    char * topic_name_buf = kmalloc(remove_bridge_args.topic_name.len + 1, GFP_KERNEL);
+    if (!topic_name_buf) return -ENOMEM;
+    if (copy_from_user(
+          topic_name_buf, (char __user *)remove_bridge_args.topic_name.ptr,
+          remove_bridge_args.topic_name.len)) {
+      kfree(topic_name_buf);
+      return -EFAULT;
+    }
+    topic_name_buf[remove_bridge_args.topic_name.len] = '\0';
+    ret = agnocast_ioctl_remove_bridge(topic_name_buf, pid, remove_bridge_args.is_r2a, ipc_ns);
+    kfree(topic_name_buf);
+  } else if (cmd == AGNOCAST_CHECK_AND_REQUEST_BRIDGE_SHUTDOWN_CMD) {
+    struct ioctl_check_and_request_bridge_shutdown_args shutdown_args;
+    memset(&shutdown_args, 0, sizeof(shutdown_args));
+    ret = agnocast_ioctl_check_and_request_bridge_shutdown(pid, ipc_ns, &shutdown_args);
     if (copy_to_user(
-          (union ioctl_topic_info_args __user *)arg, &topic_info_pub_args,
-          sizeof(topic_info_pub_args)))
-      goto return_EFAULT;
+          (struct ioctl_check_and_request_bridge_shutdown_args __user *)arg, &shutdown_args,
+          sizeof(shutdown_args)))
+      return -EFAULT;
+  } else if (cmd == AGNOCAST_SET_ROS2_SUBSCRIBER_NUM_CMD) {
+    struct ioctl_set_ros2_subscriber_num_args set_ros2_sub_args;
+    if (copy_from_user(&set_ros2_sub_args, (void __user *)arg, sizeof(set_ros2_sub_args)))
+      return -EFAULT;
+    if (set_ros2_sub_args.topic_name.len >= TOPIC_NAME_BUFFER_SIZE) return -EINVAL;
+    char * topic_name_buf = kmalloc(set_ros2_sub_args.topic_name.len + 1, GFP_KERNEL);
+    if (!topic_name_buf) return -ENOMEM;
+    if (copy_from_user(
+          topic_name_buf, (char __user *)set_ros2_sub_args.topic_name.ptr,
+          set_ros2_sub_args.topic_name.len)) {
+      kfree(topic_name_buf);
+      return -EFAULT;
+    }
+    topic_name_buf[set_ros2_sub_args.topic_name.len] = '\0';
+    ret = agnocast_ioctl_set_ros2_subscriber_num(
+      topic_name_buf, ipc_ns, set_ros2_sub_args.ros2_subscriber_num);
+    kfree(topic_name_buf);
+  } else if (cmd == AGNOCAST_SET_ROS2_PUBLISHER_NUM_CMD) {
+    struct ioctl_set_ros2_publisher_num_args set_ros2_pub_args;
+    if (copy_from_user(&set_ros2_pub_args, (void __user *)arg, sizeof(set_ros2_pub_args)))
+      return -EFAULT;
+    if (set_ros2_pub_args.topic_name.len >= TOPIC_NAME_BUFFER_SIZE) return -EINVAL;
+    char * topic_name_buf = kmalloc(set_ros2_pub_args.topic_name.len + 1, GFP_KERNEL);
+    if (!topic_name_buf) return -ENOMEM;
+    if (copy_from_user(
+          topic_name_buf, (char __user *)set_ros2_pub_args.topic_name.ptr,
+          set_ros2_pub_args.topic_name.len)) {
+      kfree(topic_name_buf);
+      return -EFAULT;
+    }
+    topic_name_buf[set_ros2_pub_args.topic_name.len] = '\0';
+    ret = agnocast_ioctl_set_ros2_publisher_num(
+      topic_name_buf, ipc_ns, set_ros2_pub_args.ros2_publisher_num);
+    kfree(topic_name_buf);
+  } else if (cmd == AGNOCAST_NOTIFY_BRIDGE_SHUTDOWN_CMD) {
+    ret = agnocast_ioctl_notify_bridge_shutdown(pid);
   } else {
-    goto return_EINVAL;
+    return -EINVAL;
   }
 
-  mutex_unlock(&global_mutex);
   return ret;
-
-return_EFAULT:
-  mutex_unlock(&global_mutex);
-  return -EFAULT;
-
-return_EINVAL:
-  mutex_unlock(&global_mutex);
-  return -EINVAL;
-
-return_ENOMEM:
-  mutex_unlock(&global_mutex);
-  return -ENOMEM;
 }
 
 // =========================================
@@ -1714,7 +3045,10 @@ return_ENOMEM:
 
 #ifdef KUNIT_BUILD
 
-int get_alive_proc_num(void)
+// No locking needed for the following KUnit helper functions.
+// These are only called from single-threaded KUnit context.
+
+int agnocast_get_alive_proc_num(void)
 {
   int count = 0;
   struct process_info * proc_info;
@@ -1728,7 +3062,7 @@ int get_alive_proc_num(void)
   return count;
 }
 
-bool is_proc_exited(const pid_t pid)
+bool agnocast_is_proc_exited(const pid_t pid)
 {
   struct process_info * proc_info;
   hash_for_each_possible(proc_info_htable, proc_info, node, hash_min(pid, PROC_INFO_HASH_BITS))
@@ -1744,7 +3078,7 @@ bool is_proc_exited(const pid_t pid)
   return false;
 }
 
-int get_topic_entries_num(const char * topic_name, const struct ipc_namespace * ipc_ns)
+int agnocast_get_topic_entries_num(const char * topic_name, const struct ipc_namespace * ipc_ns)
 {
   struct topic_wrapper * wrapper = find_topic(topic_name, ipc_ns);
   if (!wrapper) {
@@ -1760,7 +3094,7 @@ int get_topic_entries_num(const char * topic_name, const struct ipc_namespace * 
   return count;
 }
 
-bool is_in_topic_entries(
+bool agnocast_is_in_topic_entries(
   const char * topic_name, const struct ipc_namespace * ipc_ns, int64_t entry_id)
 {
   struct topic_wrapper * wrapper = find_topic(topic_name, ipc_ns);
@@ -1775,7 +3109,9 @@ bool is_in_topic_entries(
   return true;
 }
 
-int get_entry_rc(
+// Returns 1 if subscriber is holding a reference to the entry, 0 otherwise.
+// Returns -1 if topic or entry not found.
+int agnocast_get_entry_rc(
   const char * topic_name, const struct ipc_namespace * ipc_ns, const int64_t entry_id,
   const topic_local_id_t pubsub_id)
 {
@@ -1789,16 +3125,14 @@ int get_entry_rc(
     return -1;
   }
 
-  for (int i = 0; i < MAX_REFERENCING_PUBSUB_NUM_PER_ENTRY; i++) {
-    if (en->referencing_ids[i] == pubsub_id) {
-      return en->reference_count[i];
-    }
+  if (pubsub_id < 0 || pubsub_id >= MAX_TOPIC_LOCAL_ID) {
+    return -1;
   }
 
-  return 0;
+  return test_bit(pubsub_id, en->referencing_subscribers) ? 1 : 0;
 }
 
-int64_t get_latest_received_entry_id(
+int64_t agnocast_get_latest_received_entry_id(
   const char * topic_name, const struct ipc_namespace * ipc_ns,
   const topic_local_id_t subscriber_id)
 {
@@ -1814,7 +3148,7 @@ int64_t get_latest_received_entry_id(
   return sub_info->latest_received_entry_id;
 }
 
-bool is_in_subscriber_htable(
+bool agnocast_is_in_subscriber_htable(
   const char * topic_name, const struct ipc_namespace * ipc_ns,
   const topic_local_id_t subscriber_id)
 {
@@ -1829,16 +3163,7 @@ bool is_in_subscriber_htable(
   return true;
 }
 
-int get_publisher_num(const char * topic_name, const struct ipc_namespace * ipc_ns)
-{
-  struct topic_wrapper * wrapper = find_topic(topic_name, ipc_ns);
-  if (!wrapper) {
-    return 0;
-  }
-  return get_size_pub_info_htable(wrapper);
-}
-
-bool is_in_publisher_htable(
+bool agnocast_is_in_publisher_htable(
   const char * topic_name, const struct ipc_namespace * ipc_ns, const topic_local_id_t publisher_id)
 {
   const struct topic_wrapper * wrapper = find_topic(topic_name, ipc_ns);
@@ -1852,7 +3177,7 @@ bool is_in_publisher_htable(
   return true;
 }
 
-int get_topic_num(const struct ipc_namespace * ipc_ns)
+int agnocast_get_topic_num(const struct ipc_namespace * ipc_ns)
 {
   int count = 0;
   struct topic_wrapper * wrapper;
@@ -1866,9 +3191,24 @@ int get_topic_num(const struct ipc_namespace * ipc_ns)
   return count;
 }
 
-bool is_in_topic_htable(const char * topic_name, const struct ipc_namespace * ipc_ns)
+bool agnocast_is_in_topic_htable(const char * topic_name, const struct ipc_namespace * ipc_ns)
 {
   return find_topic(topic_name, ipc_ns) != NULL;
+}
+
+bool agnocast_is_in_bridge_htable(const char * topic_name, const struct ipc_namespace * ipc_ns)
+{
+  const struct bridge_info * br_info = find_bridge_info(topic_name, ipc_ns);
+  return (br_info != NULL);
+}
+
+pid_t agnocast_get_bridge_owner_pid(const char * topic_name, const struct ipc_namespace * ipc_ns)
+{
+  const struct bridge_info * br_info = find_bridge_info(topic_name, ipc_ns);
+  if (br_info) {
+    return br_info->pid;
+  }
+  return -1;
 }
 
 #endif
@@ -1889,6 +3229,7 @@ static char * agnocast_devnode(struct device * dev, umode_t * mode)
 }
 
 static struct file_operations fops = {
+  .owner = THIS_MODULE,
   .unlocked_ioctl = agnocast_ioctl,
 };
 
@@ -1898,7 +3239,8 @@ static void remove_entry_node(struct topic_wrapper * wrapper, struct entry_node 
   kfree(en);
 }
 
-static void pre_handler_subscriber_exit(struct topic_wrapper * wrapper, const pid_t pid)
+static void pre_handler_subscriber_exit(
+  struct topic_wrapper * wrapper, const pid_t pid, struct process_info * proc_info)
 {
   struct subscriber_info * sub_info;
   int bkt_sub_info;
@@ -1908,9 +3250,40 @@ static void pre_handler_subscriber_exit(struct topic_wrapper * wrapper, const pi
     if (sub_info->pid != pid) continue;
 
     const topic_local_id_t subscriber_id = sub_info->id;
+
+    // Save subscription info for daemon cleanup before deleting the subscriber
+    if (proc_info->exit_subscription_count >= MAX_SUBSCRIPTION_NUM_PER_PROCESS) {
+      dev_warn(
+        agnocast_device,
+        "exit_subscription_list is full for pid=%d, subscription MQ may leak. "
+        "(pre_handler_subscriber_exit)\n",
+        pid);
+    } else {
+      struct exit_subscription_entry * exit_entry =
+        kmalloc(sizeof(struct exit_subscription_entry), GFP_KERNEL);
+      if (exit_entry) {
+        strscpy(exit_entry->topic_name, wrapper->key, TOPIC_NAME_BUFFER_SIZE);
+        exit_entry->subscriber_id = subscriber_id;
+        list_add_tail(&exit_entry->list, &proc_info->exit_subscription_list);
+        proc_info->exit_subscription_count++;
+      } else {
+        dev_warn(
+          agnocast_device,
+          "kmalloc failed for exit_subscription_entry, subscription MQ may leak. "
+          "(pre_handler_subscriber_exit)\n");
+      }
+    }
+
     hash_del(&sub_info->node);
     kfree(sub_info->node_name);
     kfree(sub_info);
+
+    if (subscriber_id < 0 || subscriber_id >= MAX_TOPIC_LOCAL_ID) {
+      dev_warn(
+        agnocast_device, "subscriber_id %d out of range [0, %d). (pre_handler_subscriber_exit)\n",
+        subscriber_id, MAX_TOPIC_LOCAL_ID);
+      continue;
+    }
 
     struct rb_root * root = &wrapper->topic.entries;
     struct rb_node * node = rb_first(root);
@@ -1918,11 +3291,8 @@ static void pre_handler_subscriber_exit(struct topic_wrapper * wrapper, const pi
       struct entry_node * en = rb_entry(node, struct entry_node, node);
       node = rb_next(node);
 
-      for (int i = 0; i < MAX_REFERENCING_PUBSUB_NUM_PER_ENTRY; i++) {
-        if (en->referencing_ids[i] == subscriber_id) {
-          remove_reference_by_index(en, i);
-        }
-      }
+      // The subscriber may not have referenced this entry, so the bit may already be 0.
+      clear_bit(subscriber_id, en->referencing_subscribers);
 
       if (is_referenced(en)) continue;
 
@@ -1932,8 +3302,8 @@ static void pre_handler_subscriber_exit(struct topic_wrapper * wrapper, const pi
       hash_for_each_possible(wrapper->topic.pub_info_htable, pub_info, node, hash_val)
       {
         if (pub_info->id == en->publisher_id) {
-          const struct process_info * proc_info = find_process_info(pub_info->pid);
-          if (!proc_info || proc_info->exited) {
+          const struct process_info * pub_proc_info = find_process_info(pub_info->pid);
+          if (!pub_proc_info || pub_proc_info->exited) {
             publisher_exited = true;
           }
           break;
@@ -1964,6 +3334,8 @@ static void pre_handler_publisher_exit(struct topic_wrapper * wrapper, const pid
 
     const topic_local_id_t publisher_id = pub_info->id;
 
+    // Publisher-side handles do not participate in reference counting, so we don't need
+    // to remove publisher references. Just clean up entries that have no subscriber references.
     struct rb_root * root = &wrapper->topic.entries;
     struct rb_node * node = rb_first(root);
     while (node) {
@@ -1971,12 +3343,6 @@ static void pre_handler_publisher_exit(struct topic_wrapper * wrapper, const pid
       node = rb_next(node);
 
       if (en->publisher_id != publisher_id) continue;
-
-      for (int i = 0; i < MAX_REFERENCING_PUBSUB_NUM_PER_ENTRY; i++) {
-        if (en->referencing_ids[i] == publisher_id) {
-          remove_reference_by_index(en, i);
-        }
-      }
 
       if (!is_referenced(en)) {
         pub_info->entries_num--;
@@ -1992,7 +3358,9 @@ static void pre_handler_publisher_exit(struct topic_wrapper * wrapper, const pid
   }
 }
 
-// Ring buffer to hold exited pids
+// Ring buffer to hold exited pids.
+// EXIT_QUEUE_SIZE (65536) far exceeds mempool_num (default 4096), and only Agnocast PIDs are
+// enqueued (via is_agnocast_pid()), each exiting at most once, so the ring buffer cannot overflow.
 static DEFINE_SPINLOCK(pid_queue_lock);
 static pid_t exit_pid_queue[EXIT_QUEUE_SIZE];
 static uint32_t queue_head;
@@ -2003,35 +3371,42 @@ static struct task_struct * worker_task;
 static DECLARE_WAIT_QUEUE_HEAD(worker_wait);
 static int has_new_pid = false;
 
-void process_exit_cleanup(const pid_t pid)
+// Called from sched_process_exit tracepoint. Not an ioctl function, so we manage locks here
+// directly.
+void agnocast_process_exit_cleanup(const pid_t pid)
 {
-  // Quickly determine if it is an Agnocast-related process.
-  struct process_info * proc_info;
-  struct hlist_node * tmp;
+  down_write(&global_htables_rwsem);
+
+  // The PID was already filtered by is_agnocast_pid() in the kprobe handler, but the state may
+  // have changed between then and now (e.g., the process was already cleaned up by a prior call).
+  struct process_info * proc_info = NULL;
   uint32_t hash_val = hash_min(pid, PROC_INFO_HASH_BITS);
-  bool agnocast_related = false;
-  hash_for_each_possible_safe(proc_info_htable, proc_info, tmp, node, hash_val)
+  hash_for_each_possible(proc_info_htable, proc_info, node, hash_val)
   {
     if (proc_info->global_pid == pid) {
-      // This proc_info will be removed from proc_info_htable later by the unlink daemon.
-      proc_info->exited = true;
-      agnocast_related = true;
       break;
     }
   }
 
-  if (!agnocast_related) return;
+  if (!proc_info || proc_info->global_pid != pid) {
+    up_write(&global_htables_rwsem);
+    return;
+  }
+
+  // This proc_info will be removed from proc_info_htable later by the unlink daemon.
+  proc_info->exited = true;
 
   free_memory(pid);
 
   struct topic_wrapper * wrapper;
   struct hlist_node * node;
+  struct hlist_node * tmp;
   int bkt;
   hash_for_each_safe(topic_hashtable, bkt, node, wrapper, node)
   {
     pre_handler_publisher_exit(wrapper, pid);
 
-    pre_handler_subscriber_exit(wrapper, pid);
+    pre_handler_subscriber_exit(wrapper, pid, proc_info);
 
     // Check if we can release the topic_wrapper
     if (get_size_pub_info_htable(wrapper) == 0 && get_size_sub_info_htable(wrapper) == 0) {
@@ -2043,46 +3418,60 @@ void process_exit_cleanup(const pid_t pid)
     }
   }
 
+  struct bridge_info * br_info;
+  hash_for_each_safe(bridge_htable, bkt, tmp, br_info, node)
+  {
+    if (br_info->pid == pid) {
+      hash_del(&br_info->node);
+      if (br_info->topic_name) {
+        kfree(br_info->topic_name);
+      }
+      kfree(br_info);
+    }
+  }
+
+  up_write(&global_htables_rwsem);
+
 #ifndef KUNIT_BUILD
-  dev_info(agnocast_device, "Process (pid=%d) has exited. (process_exit_cleanup)\n", pid);
+  dev_info(agnocast_device, "Process (pid=%d) has exited. (agnocast_process_exit_cleanup)\n", pid);
 #endif
 }
 
 static int exit_worker_thread(void * data)
 {
   while (!kthread_should_stop()) {
-    pid_t pid;
-    unsigned long flags;
-    bool got_pid = false;
-
     wait_event_interruptible(worker_wait, smp_load_acquire(&has_new_pid) || kthread_should_stop());
 
     if (kthread_should_stop()) break;
 
-    spin_lock_irqsave(&pid_queue_lock, flags);
+    // Drain all queued PIDs in a single wake-up cycle
+    while (true) {
+      pid_t pid;
+      unsigned long flags;
+      bool got_pid = false;
 
-    if (queue_head != queue_tail) {
-      pid = exit_pid_queue[queue_head];
-      queue_head = (queue_head + 1) & (EXIT_QUEUE_SIZE - 1);
-      got_pid = true;
-    }
+      spin_lock_irqsave(&pid_queue_lock, flags);
 
-    // queue is empty
-    if (queue_head == queue_tail) smp_store_release(&has_new_pid, 0);
+      if (queue_head != queue_tail) {
+        pid = exit_pid_queue[queue_head];
+        queue_head = (queue_head + 1) & EXIT_QUEUE_MASK;
+        got_pid = true;
+      }
 
-    spin_unlock_irqrestore(&pid_queue_lock, flags);
+      if (queue_head == queue_tail) smp_store_release(&has_new_pid, 0);
 
-    if (got_pid) {
-      mutex_lock(&global_mutex);
-      process_exit_cleanup(pid);
-      mutex_unlock(&global_mutex);
+      spin_unlock_irqrestore(&pid_queue_lock, flags);
+
+      if (!got_pid) break;
+
+      agnocast_process_exit_cleanup(pid);
     }
   }
 
   return 0;
 }
 
-void enqueue_exit_pid(const pid_t pid)
+void agnocast_enqueue_exit_pid(const pid_t pid)
 {
   unsigned long flags;
   uint32_t next;
@@ -2091,8 +3480,7 @@ void enqueue_exit_pid(const pid_t pid)
 
   spin_lock_irqsave(&pid_queue_lock, flags);
 
-  // Assumes EXIT_QUEUE_SIZE is 2^N
-  next = (queue_tail + 1) & (EXIT_QUEUE_SIZE - 1);
+  next = (queue_tail + 1) & EXIT_QUEUE_MASK;
 
   if (next != queue_head) {  // queue is not full
     exit_pid_queue[queue_tail] = pid;
@@ -2108,40 +3496,85 @@ void enqueue_exit_pid(const pid_t pid)
   } else {
     dev_warn(
       agnocast_device,
-      "exit_pid_queue is full! consider expanding the queue size. (pre_handler_do_exit)\n");
+      "exit_pid_queue is full! consider expanding the queue size. (enqueue_exit_pid)\n");
   }
 }
 
-static int pre_handler_do_exit(struct kprobe * p, struct pt_regs * regs)
+// RCU-protected check: returns true if pid is registered in agnocast.
+bool is_agnocast_pid(const pid_t pid)
 {
-  const pid_t pid = current->pid;
-  enqueue_exit_pid(pid);
-  return 0;
+  struct process_info * proc_info;
+  bool found = false;
+  rcu_read_lock();
+  hash_for_each_possible_rcu(proc_info_htable, proc_info, node, hash_min(pid, PROC_INFO_HASH_BITS))
+  {
+    if (proc_info->global_pid == pid) {
+      found = true;
+      break;
+    }
+  }
+  rcu_read_unlock();
+  return found;
 }
 
-static struct kprobe kp_do_exit = {
-  .symbol_name = "do_exit",
-  .pre_handler = pre_handler_do_exit,
-};
+static struct tracepoint * tp_sched_process_exit;
 
-void agnocast_init_mutexes(void)
+static void agnocast_process_exit(void * data, struct task_struct * task)
 {
-  mutex_init(&global_mutex);
+  // Wait until all threads in the thread group have exited.
+  // The thread group leader isn't always the last to exit, so instead of checking
+  // pid == tgid, we check that no live threads remain in the group.
+  if (atomic_read(&task->signal->live) != 0) return;
+
+  // Skip non-Agnocast PIDs to avoid the full
+  // enqueue → wake → dequeue → rwsem pipeline for unrelated exits.
+  if (is_agnocast_pid(task->tgid)) agnocast_enqueue_exit_pid(task->tgid);
 }
 
-void agnocast_init_device(void)
+static void find_sched_process_exit_tp(struct tracepoint * tp, void * priv)
 {
+  if (strcmp(tp->name, "sched_process_exit") == 0) {
+    tp_sched_process_exit = tp;
+  }
+}
+
+int agnocast_init_device(void)
+{
+  int ret;
+
   major = register_chrdev(0, "agnocast" /*device driver name*/, &fops);
+  if (major < 0) {
+    pr_err("agnocast: register_chrdev failed: %d\n", major);
+    return major;
+  }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
   agnocast_class = class_create("agnocast_class");
 #else
   agnocast_class = class_create(THIS_MODULE, "agnocast_class");
 #endif
+  if (IS_ERR(agnocast_class)) {
+    ret = PTR_ERR(agnocast_class);
+    pr_err("agnocast: class_create failed: %d\n", ret);
+    goto err_unregister_chrdev;
+  }
 
   agnocast_class->devnode = agnocast_devnode;
   agnocast_device =
     device_create(agnocast_class, NULL, MKDEV(major, 0), NULL, "agnocast" /*file name*/);
+  if (IS_ERR(agnocast_device)) {
+    ret = PTR_ERR(agnocast_device);
+    pr_err("agnocast: device_create failed: %d\n", ret);
+    goto err_class_destroy;
+  }
+
+  return 0;
+
+err_class_destroy:
+  class_destroy(agnocast_class);
+err_unregister_chrdev:
+  unregister_chrdev(major, "agnocast");
+  return ret;
 }
 
 int agnocast_init_kthread(void)
@@ -2157,13 +3590,19 @@ int agnocast_init_kthread(void)
   return 0;
 }
 
-int agnocast_init_kprobe(void)
+int agnocast_init_exit_hook(void)
 {
-  int ret = register_kprobe(&kp_do_exit);
-  if (ret < 0) {
-    dev_warn(
-      agnocast_device, "register_kprobe for do_exit failed, returned %d. (agnocast_init_kprobe)\n",
-      ret);
+  int ret;
+
+  for_each_kernel_tracepoint(find_sched_process_exit_tp, NULL);
+  if (!tp_sched_process_exit) {
+    dev_warn(agnocast_device, "sched_process_exit tracepoint not found\n");
+    return -ENOENT;
+  }
+
+  ret = tracepoint_probe_register(tp_sched_process_exit, agnocast_process_exit, NULL);
+  if (ret) {
+    dev_warn(agnocast_device, "tracepoint_probe_register failed: %d\n", ret);
     return ret;
   }
 
@@ -2175,17 +3614,29 @@ static int agnocast_init(void)
 {
   int ret;
 
-  agnocast_init_mutexes();
-
-  agnocast_init_device();
+  ret = agnocast_init_device();
+  if (ret < 0) return ret;
 
   ret = agnocast_init_kthread();
-  if (ret < 0) return ret;
+  if (ret < 0) {
+    agnocast_exit_device();
+    return ret;
+  }
 
-  ret = agnocast_init_kprobe();
-  if (ret < 0) return ret;
+  ret = agnocast_init_exit_hook();
+  if (ret < 0) {
+    agnocast_exit_kthread();
+    agnocast_exit_device();
+    return ret;
+  }
 
-  init_memory_allocator();
+  ret = init_memory_allocator();
+  if (ret < 0) {
+    agnocast_exit_exit_hook();
+    agnocast_exit_kthread();
+    agnocast_exit_device();
+    return ret;
+  }
 
   dev_info(agnocast_device, "Agnocast installed! v%s\n", VERSION);
   return 0;
@@ -2241,17 +3692,36 @@ static void remove_all_process_info(void)
   struct hlist_node * tmp;
   hash_for_each_safe(proc_info_htable, bkt, tmp, proc_info, node)
   {
-    hash_del(&proc_info->node);
-    kfree(proc_info);
+    free_exit_subscription_list(proc_info);
+    hash_del_rcu(&proc_info->node);
+    kfree_rcu(proc_info, rcu_head);
+  }
+  // No explicit synchronize_rcu() needed: kfree_rcu() defers freeing until after the grace period.
+}
+
+static void remove_all_bridge_info(void)
+{
+  struct bridge_info * br_info;
+  int bkt;
+  struct hlist_node * tmp;
+  hash_for_each_safe(bridge_htable, bkt, tmp, br_info, node)
+  {
+    hash_del(&br_info->node);
+    if (br_info->topic_name) {
+      kfree(br_info->topic_name);
+    }
+    kfree(br_info);
   }
 }
 
+// Called during module unload. Not an ioctl function, so we manage locks here directly.
 void agnocast_exit_free_data(void)
 {
-  mutex_lock(&global_mutex);
+  down_write(&global_htables_rwsem);
   remove_all_topics();
   remove_all_process_info();
-  mutex_unlock(&global_mutex);
+  remove_all_bridge_info();
+  up_write(&global_htables_rwsem);
 }
 
 void agnocast_exit_kthread(void)
@@ -2260,9 +3730,12 @@ void agnocast_exit_kthread(void)
   kthread_stop(worker_task);
 }
 
-void agnocast_exit_kprobe(void)
+void agnocast_exit_exit_hook(void)
 {
-  unregister_kprobe(&kp_do_exit);
+  if (tp_sched_process_exit) {
+    tracepoint_probe_unregister(tp_sched_process_exit, agnocast_process_exit, NULL);
+    tracepoint_synchronize_unregister();
+  }
 }
 
 void agnocast_exit_device(void)
@@ -2276,9 +3749,10 @@ void agnocast_exit_device(void)
 static void agnocast_exit(void)
 {
   agnocast_exit_kthread();
-  agnocast_exit_kprobe();
+  agnocast_exit_exit_hook();
 
   agnocast_exit_free_data();
+  cleanup_memory_allocator();
   dev_info(agnocast_device, "Agnocast removed!\n");
   agnocast_exit_device();
 }

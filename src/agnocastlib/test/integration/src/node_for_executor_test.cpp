@@ -21,7 +21,11 @@ NodeForExecutorTest::NodeForExecutorTest(
   for (int64_t i = 0; i < num_agnocast_sub_cbs; i++) {
     add_agnocast_sub_cb();
   }
-  agnocast_sub_cbs_called_.assign(num_agnocast_sub_cbs + num_agnocast_cbs_to_be_added, false);
+  num_total_agnocast_sub_cbs_ = num_agnocast_sub_cbs + num_agnocast_cbs_to_be_added;
+  agnocast_sub_cbs_called_ = std::make_unique<std::atomic<bool>[]>(num_total_agnocast_sub_cbs_);
+  for (size_t i = 0; i < num_total_agnocast_sub_cbs_; i++) {
+    agnocast_sub_cbs_called_[i].store(false, std::memory_order_relaxed);
+  }
 
   // For ROS 2
   ros2_pub_ = create_publisher<std_msgs::msg::Bool>(ros2_topic_name_, 1);
@@ -38,23 +42,30 @@ NodeForExecutorTest::NodeForExecutorTest(
       [this, i](const std::shared_ptr<const std_msgs::msg::Bool> msg) { ros2_sub_cb(msg, i); },
       options));
   }
-  ros2_sub_cbs_called_.assign(num_ros2_sub_cbs, false);
+  num_ros2_sub_cbs_ = num_ros2_sub_cbs;
+  ros2_sub_cbs_called_ = std::make_unique<std::atomic<bool>[]>(num_ros2_sub_cbs_);
+  for (size_t i = 0; i < num_ros2_sub_cbs_; i++) {
+    ros2_sub_cbs_called_[i].store(false, std::memory_order_relaxed);
+  }
 }
 
 NodeForExecutorTest::~NodeForExecutorTest()
 {
   for (auto & mq_sender : mq_senders_) {
     if (mq_close(mq_sender.second) == -1) {
-      std::cerr << "mq_close failed: " << strerror(errno) << std::endl;
+      std::cerr << "mq_close failed for mq_name='" << mq_sender.first << "': " << strerror(errno)
+                << std::endl;
     }
   }
 
   for (auto & mq_receiver : mq_receivers_) {
     if (mq_close(mq_receiver.first) == -1) {
-      std::cerr << "mq_close failed: " << strerror(errno) << std::endl;
+      std::cerr << "mq_close failed for mq_name='" << mq_receiver.second << "': " << strerror(errno)
+                << std::endl;
     }
     if (mq_unlink(mq_receiver.second.c_str()) == -1) {
-      std::cerr << "mq_unlink failed: " << strerror(errno) << std::endl;
+      std::cerr << "mq_unlink failed for mq_name='" << mq_receiver.second
+                << "': " << strerror(errno) << std::endl;
     }
   }
 }
@@ -91,7 +102,7 @@ mqd_t NodeForExecutorTest::open_mq_for_receiver(const int64_t cb_i)
   const int mq_mode = 0666;
   mqd_t mq = mq_open(mq_name.c_str(), O_CREAT | O_RDONLY | O_NONBLOCK, mq_mode, &attr);
   if (mq == -1) {
-    std::cerr << "mq_open failed: " << strerror(errno) << std::endl;
+    std::cerr << "mq_open failed for mq_name='" << mq_name << "': " << strerror(errno) << std::endl;
     exit(EXIT_FAILURE);
   }
   mq_receivers_.push_back(std::make_pair(mq, mq_name));
@@ -118,7 +129,8 @@ void NodeForExecutorTest::agnocast_timer_cb()
     } else {
       mq = mq_open(mq_receiver.second.c_str(), O_WRONLY | O_NONBLOCK);
       if (mq == -1) {
-        std::cerr << "mq_open failed: " << strerror(errno) << std::endl;
+        std::cerr << "mq_open failed for mq_name='" << mq_receiver.second
+                  << "': " << strerror(errno) << std::endl;
         exit(EXIT_FAILURE);
       }
       mq_senders_.insert({mq_receiver.second, mq});
@@ -127,14 +139,15 @@ void NodeForExecutorTest::agnocast_timer_cb()
     agnocast::MqMsgAgnocast mq_msg = {};
     if (mq_send(mq, reinterpret_cast<char *>(&mq_msg), 0 /*msg_len*/, 0) == -1) {
       if (errno != EAGAIN) {
-        std::cerr << "mq_send failed: " << strerror(errno) << std::endl;
+        std::cerr << "mq_send failed for mq_name='" << mq_receiver.second
+                  << "': " << strerror(errno) << std::endl;
         exit(EXIT_FAILURE);
       }
     }
   }
 
   // Add new agnocast sub callbacks
-  if (mq_receivers_.size() < agnocast_sub_cbs_called_.size()) {
+  if (mq_receivers_.size() < num_total_agnocast_sub_cbs_) {
     add_agnocast_sub_cb();
   }
 }
@@ -147,8 +160,7 @@ void NodeForExecutorTest::agnocast_sub_cb(
     is_mutually_exclusive_agnocast_ = false;
   }
 
-  // Each callback only accesses its own index, so it's safe to access the vector without a mutex.
-  agnocast_sub_cbs_called_[cb_i] = true;
+  agnocast_sub_cbs_called_[cb_i].store(true, std::memory_order_release);
   dummy_work(cb_exec_time_);
 }
 
@@ -167,23 +179,28 @@ void NodeForExecutorTest::ros2_sub_cb(
     is_mutually_exclusive_ros2_ = false;
   }
 
-  // Each callback only accesses its own index, so it's safe to access the vector without a mutex.
-  ros2_sub_cbs_called_[cb_i] = true;
+  ros2_sub_cbs_called_[cb_i].store(true, std::memory_order_release);
   dummy_work(cb_exec_time_);
 }
 
 bool NodeForExecutorTest::is_all_ros2_sub_cbs_called() const
 {
-  return std::all_of(ros2_sub_cbs_called_.begin(), ros2_sub_cbs_called_.end(), [](bool is_called) {
-    return is_called;
-  });
+  for (size_t i = 0; i < num_ros2_sub_cbs_; i++) {
+    if (!ros2_sub_cbs_called_[i].load(std::memory_order_acquire)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 bool NodeForExecutorTest::is_all_agnocast_sub_cbs_called() const
 {
-  return std::all_of(
-    agnocast_sub_cbs_called_.begin(), agnocast_sub_cbs_called_.end(),
-    [](bool is_called) { return is_called; });
+  for (size_t i = 0; i < num_total_agnocast_sub_cbs_; i++) {
+    if (!agnocast_sub_cbs_called_[i].load(std::memory_order_acquire)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 bool NodeForExecutorTest::is_mutually_exclusive_agnocast() const
