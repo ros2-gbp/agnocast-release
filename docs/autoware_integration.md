@@ -17,11 +17,10 @@ target_include_directories(target_library PRIVATE
 )
 ```
 
-For launch.xml ( `AGNOCAST_MEMPOOL_SIZE` can be configured based on how much the process will consume heap memory, see [shared memory](./docs/shared_memory.md) for more detail.):
+For launch.xml:
 
 ```xml
 <env name="LD_PRELOAD" value="libagnocast_heaphook.so"/>
-<env name="AGNOCAST_MEMPOOL_SIZE" value="134217728"/>  <!-- 128MB -->
 ```
 
 For packages.xml:
@@ -53,5 +52,5 @@ message_sub_ = agnocast::create_subscription<MessageType>("/topic_name", rclcpp:
 ### Other tips
 
 - Until the subscription callback thread is integrated into ROS 2 executor, all callback functions should be guarded with mutex lock.
-- Although Agnocast already has `get_subscription_count()` API, it is not still complete. There is an issue ticket <https://github.com/tier4/agnocast/issues/181>.
-- Agnocast does not support `publish_if_subscribed()` API yet. There is an issue ticket <https://github.com/tier4/agnocast/issues/164>.
+- Although Agnocast already has `get_subscription_count()` API, it is not still complete. There is an issue ticket <https://github.com/autowarefoundation/agnocast/issues/181>.
+- Agnocast does not support `publish_if_subscribed()` API yet. There is an issue ticket <https://github.com/autowarefoundation/agnocast/issues/164>.

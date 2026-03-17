@@ -2,6 +2,24 @@
 Changelog for package agnocast_ioctl_wrapper
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+2.3.1 (2026-03-17)
+------------------
+
+2.3.0 (2026-03-09)
+------------------
+* feat(kmod): bump capacity constants and default mempool size (`#1151 <https://github.com/autowarefoundation/agnocast/issues/1151>`_)
+* fix(kmod)[need-minor-update]: add `topic_name_buffer_size` field for `get_agnocast_pub/sub_topics` (`#1113 <https://github.com/autowarefoundation/agnocast/issues/1113>`_)
+
+2.2.0 (2026-02-19)
+------------------
+* feat(kmod)[need-minor-update]: increase MAX_PUBLISHER_NUM (`#1060 <https://github.com/tier4/agnocast/issues/1060>`_)
+* feat(kmod): Increase MAX_SUBSCRIBER_NUM by using bitmap (`#1015 <https://github.com/tier4/agnocast/issues/1015>`_)
+* feat(agnocast_ioctl_wrapper, ros2agnocast): enhance topic list agnocast command (`#1002 <https://github.com/tier4/agnocast/issues/1002>`_)
+* feat(agnocast_ioctl_wrapper, ros2agnocast): mode print feature topic list (`#992 <https://github.com/tier4/agnocast/issues/992>`_)
+* refactor(agnocastlib)[needs minor version update]: add debug mode for bridge (`#963 <https://github.com/tier4/agnocast/issues/963>`_)
+* fix(agnocastlib): error output when opening agnocast driver failed (`#732 <https://github.com/tier4/agnocast/issues/732>`_)
+* fix(ros2agnocast): account for topic names used by Agnocast services (`#712 <https://github.com/tier4/agnocast/issues/712>`_)
+
 2.1.2 (2025-08-18)
 ------------------
 

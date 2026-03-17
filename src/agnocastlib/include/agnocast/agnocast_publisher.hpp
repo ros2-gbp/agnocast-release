@@ -5,6 +5,7 @@
 #include "agnocast/agnocast_smart_pointer.hpp"
 #include "agnocast/agnocast_tracepoint_wrapper.h"
 #include "agnocast/agnocast_utils.hpp"
+#include "rclcpp/detail/qos_parameters.hpp"
 #include "rclcpp/rclcpp.hpp"
 
 #include <fcntl.h>
@@ -18,21 +19,27 @@
 
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <queue>
 #include <thread>
 
 namespace agnocast
 {
+class Node;
+
+const void * get_node_base_address(Node * node);
 
 // These are cut out of the class for information hiding.
 topic_local_id_t initialize_publisher(
-  const std::string & topic_name, const std::string & node_name, const rclcpp::QoS & qos);
+  const std::string & topic_name, const std::string & node_name, const rclcpp::QoS & qos,
+  const bool is_bridge);
 union ioctl_publish_msg_args publish_core(
   [[maybe_unused]] const void * publisher_handle, /* for CARET */ const std::string & topic_name,
   const topic_local_id_t publisher_id, const uint64_t msg_virtual_address,
   std::unordered_map<topic_local_id_t, std::tuple<mqd_t, bool>> & opened_mqs);
 uint32_t get_subscription_count_core(const std::string & topic_name);
+uint32_t get_intra_subscription_count_core(const std::string & topic_name);
 void increment_borrowed_publisher_num();
 void decrement_borrowed_publisher_num();
 
@@ -41,135 +48,123 @@ extern "C" uint32_t agnocast_get_borrowed_publisher_num();
 
 struct PublisherOptions
 {
-  // For transient local. If true, publish() does both Agnocast publish and ROS 2 publish,
-  // regardless of the existence of ROS 2 subscriptions.
-  bool do_always_ros2_publish = true;
-  // No overrides allowed by default.
-  rclcpp::QosOverridingOptions qos_overriding_options;
+  bool do_always_ros2_publish = false;
+  rclcpp::QosOverridingOptions qos_overriding_options{};
 };
 
-template <typename MessageT>
-class Publisher
+template <typename MessageT, typename BridgeRequestPolicy>
+class BasicPublisher
 {
   topic_local_id_t id_ = -1;
   std::string topic_name_;
   std::unordered_map<topic_local_id_t, std::tuple<mqd_t, bool>> opened_mqs_;
-  PublisherOptions options_;
+  rmw_gid_t gid_;
 
-  // ROS2 publish related variables
-  typename rclcpp::Publisher<MessageT>::SharedPtr ros2_publisher_;
-  mqd_t ros2_publish_mq_;
-  std::string ros2_publish_mq_name_;
-  std::queue<ipc_shared_ptr<MessageT>> ros2_message_queue_;
-  std::thread ros2_publish_thread_;
-  std::mutex ros2_publish_mtx_;
+  void generate_gid()
+  {
+    std::memset(gid_.data, 0, RMW_GID_STORAGE_SIZE);
+
+    // [0-1]: Agnocast identifier
+    gid_.data[0] = 'A';
+    gid_.data[1] = 'G';
+
+    // [2-5]: Process ID
+    pid_t pid = getpid();
+    std::memcpy(gid_.data + 2, &pid, sizeof(pid));
+
+    // [6-11]: topic_name hash (upper 6 bytes)
+    size_t topic_hash = std::hash<std::string>{}(topic_name_);
+    std::memcpy(gid_.data + 6, &topic_hash, 6);
+
+    // [12-15]: publisher id
+    std::memcpy(gid_.data + 12, &id_, sizeof(id_));
+
+    // [16-23]: reserved
+
+    gid_.implementation_identifier = "agnocast";
+  }
+
+  template <typename NodeT>
+  rclcpp::QoS constructor_impl(
+    NodeT * node, const std::string & topic_name, const rclcpp::QoS & qos,
+    const PublisherOptions & options, const bool is_bridge)
+  {
+    if (options.do_always_ros2_publish) {
+      RCLCPP_ERROR(
+        logger,
+        "The 'do_always_ros2_publish' option is deprecated. "
+        "Use the AGNOCAST_BRIDGE_MODE environment variable instead.");
+    }
+
+    topic_name_ = node->get_node_topics_interface()->resolve_topic_name(topic_name);
+
+    auto node_parameters = node->get_node_parameters_interface();
+    const rclcpp::QoS actual_qos =
+      options.qos_overriding_options.get_policy_kinds().size()
+        ? rclcpp::detail::declare_qos_parameters(
+            options.qos_overriding_options, node_parameters, topic_name_, qos,
+            rclcpp::detail::PublisherQosParametersTraits{})
+        : qos;
+
+    validate_qos(actual_qos);
+
+    id_ =
+      initialize_publisher(topic_name_, node->get_fully_qualified_name(), actual_qos, is_bridge);
+    generate_gid();
+    BridgeRequestPolicy::template request_bridge<MessageT>(topic_name_, id_);
+
+    return actual_qos;
+  }
 
 public:
-  using SharedPtr = std::shared_ptr<Publisher<MessageT>>;
+  using SharedPtr = std::shared_ptr<BasicPublisher<MessageT, BridgeRequestPolicy>>;
 
-  Publisher(
+  BasicPublisher(
     rclcpp::Node * node, const std::string & topic_name, const rclcpp::QoS & qos,
-    const PublisherOptions & options)
-  : topic_name_(node->get_node_topics_interface()->resolve_topic_name(topic_name))
+    const PublisherOptions & options, const bool is_bridge = false)
   {
-    rclcpp::PublisherOptions pub_options;
-    pub_options.qos_overriding_options = options.qos_overriding_options;
-    ros2_publisher_ = node->create_publisher<MessageT>(topic_name_, qos, pub_options);
+    const rclcpp::QoS actual_qos = constructor_impl(node, topic_name, qos, options, is_bridge);
 
-    auto actual_qos = ros2_publisher_->get_actual_qos();
     TRACEPOINT(
       agnocast_publisher_init, static_cast<const void *>(this),
       static_cast<const void *>(
         node->get_node_base_interface()->get_shared_rcl_node_handle().get()),
       topic_name_.c_str(), actual_qos.depth());
-
-    if (actual_qos.durability() == rclcpp::DurabilityPolicy::TransientLocal) {
-      options_.do_always_ros2_publish = options.do_always_ros2_publish;
-    } else {
-      options_.do_always_ros2_publish = false;
-    }
-
-    id_ = initialize_publisher(topic_name_, node->get_fully_qualified_name(), actual_qos);
-
-    ros2_publish_mq_name_ = create_mq_name_for_ros2_publish(topic_name_, id_);
-
-    const int mq_mode = 0666;
-    struct mq_attr attr = {};
-    attr.mq_flags = 0;
-    attr.mq_maxmsg = 1;
-    attr.mq_msgsize = sizeof(MqMsgROS2Publish);
-    attr.mq_curmsgs = 0;
-    ros2_publish_mq_ =
-      mq_open(ros2_publish_mq_name_.c_str(), O_CREAT | O_WRONLY | O_NONBLOCK, mq_mode, &attr);
-    if (ros2_publish_mq_ == -1) {
-      RCLCPP_ERROR(logger, "mq_open failed: %s", strerror(errno));
-      close(agnocast_fd);
-      exit(EXIT_FAILURE);
-    }
-
-    ros2_publish_thread_ = std::thread([this]() { do_ros2_publish(); });
   }
 
-  ~Publisher()
+  BasicPublisher(
+    agnocast::Node * node, const std::string & topic_name, const rclcpp::QoS & qos,
+    const PublisherOptions & options = PublisherOptions{})
   {
-    MqMsgROS2Publish mq_msg = {};
-    mq_msg.should_terminate = true;
-    if (mq_send(ros2_publish_mq_, reinterpret_cast<char *>(&mq_msg), sizeof(mq_msg), 0) == -1) {
-      RCLCPP_ERROR(logger, "mq_send failed: %s", strerror(errno));
-    }
+    const rclcpp::QoS actual_qos = constructor_impl(node, topic_name, qos, options, false);
 
-    ros2_publish_thread_.join();
-
-    if (mq_close(ros2_publish_mq_) == -1) {
-      RCLCPP_ERROR(logger, "mq_close failed: %s", strerror(errno));
-    }
-
-    if (mq_unlink(ros2_publish_mq_name_.c_str()) == -1) {
-      RCLCPP_ERROR(logger, "mq_unlink failed: %s", strerror(errno));
-    }
+    TRACEPOINT(
+      agnocast_publisher_init, static_cast<const void *>(this),
+      static_cast<const void *>(get_node_base_address(node)), topic_name_.c_str(),
+      actual_qos.depth());
   }
 
-  void do_ros2_publish()
+  ~BasicPublisher()
   {
-    mqd_t mq = mq_open(ros2_publish_mq_name_.c_str(), O_RDONLY);
-    if (mq == -1) {
-      RCLCPP_ERROR(logger, "mq_open failed: %s", strerror(errno));
-      close(agnocast_fd);
-      exit(EXIT_FAILURE);
-    }
-
-    while (true) {
-      MqMsgROS2Publish mq_msg = {};
-      auto ret = mq_receive(mq, reinterpret_cast<char *>(&mq_msg), sizeof(mq_msg), nullptr);
-      if (ret == -1) {
-        RCLCPP_ERROR(logger, "mq_receive failed: %s", strerror(errno));
-        close(agnocast_fd);
-        exit(EXIT_FAILURE);
-      }
-
-      if (mq_msg.should_terminate) {
-        break;
-      }
-
-      while (true) {
-        ipc_shared_ptr<MessageT> message;
-
-        {
-          std::scoped_lock lock(ros2_publish_mtx_);
-          if (ros2_message_queue_.empty()) {
-            break;
-          }
-
-          message = std::move(ros2_message_queue_.front());
-          ros2_message_queue_.pop();
-        }
-
-        ros2_publisher_->publish(*message.get());
+    for (auto & [_, t] : opened_mqs_) {
+      mqd_t mq = std::get<0>(t);
+      if (mq_close(mq) == -1) {
+        RCLCPP_ERROR_STREAM(
+          logger, "mq_close failed for topic '" << topic_name_ << "': " << strerror(errno));
       }
     }
 
-    if (mq_close(mq) == -1) {
-      RCLCPP_ERROR(logger, "mq_close failed: %s", strerror(errno));
+    // NOTE: When a publisher is destroyed, subscribers should unmap its memory, but this is not yet
+    // implemented. Since multiple publishers in the same process share a mempool, process-level
+    // reference counting in kmod is needed. Leaving memory mapped causes no functional issues, so
+    // this is left as future work.
+    struct ioctl_remove_publisher_args remove_publisher_args
+    {
+    };
+    remove_publisher_args.topic_name = {topic_name_.c_str(), topic_name_.size()};
+    remove_publisher_args.publisher_id = id_;
+    if (ioctl(agnocast_fd, AGNOCAST_REMOVE_PUBLISHER_CMD, &remove_publisher_args) < 0) {
+      RCLCPP_WARN(logger, "Failed to remove publisher (id=%d) from kernel.", id_);
     }
   }
 
@@ -188,43 +183,46 @@ public:
       exit(EXIT_FAILURE);
     }
 
+    // Capture raw pointer BEFORE invalidation (get() returns nullptr after invalidation).
+    const uint64_t msg_virtual_address = reinterpret_cast<uint64_t>(message.get());
+
+    // Invalidate all references sharing this handle's control block.
+    // Any remaining copies held elsewhere will fail-fast on dereference.
+    message.invalidate_all_references();
+
     decrement_borrowed_publisher_num();
 
     const union ioctl_publish_msg_args publish_msg_args =
-      publish_core(this, topic_name_, id_, reinterpret_cast<uint64_t>(message.get()), opened_mqs_);
-
-    message.set_entry_id(publish_msg_args.ret_entry_id);
+      publish_core(this, topic_name_, id_, msg_virtual_address, opened_mqs_);
 
     for (uint32_t i = 0; i < publish_msg_args.ret_released_num; i++) {
       MessageT * release_ptr = reinterpret_cast<MessageT *>(publish_msg_args.ret_released_addrs[i]);
       delete release_ptr;
     }
 
-    if (options_.do_always_ros2_publish || ros2_publisher_->get_subscription_count() > 0) {
-      {
-        std::lock_guard<std::mutex> lock(ros2_publish_mtx_);
-        ros2_message_queue_.push(std::move(message));
-      }
-
-      MqMsgROS2Publish mq_msg = {};
-      mq_msg.should_terminate = false;
-      if (mq_send(ros2_publish_mq_, reinterpret_cast<char *>(&mq_msg), sizeof(mq_msg), 0) == -1) {
-        // If it returns EAGAIN, it means mq_send has already been executed, but the ros2 publish
-        // thread hasn't received it yet. Thus, there's no need to send it again since the
-        // notification has already been sent.
-        if (errno != EAGAIN) {
-          RCLCPP_ERROR(logger, "mq_send failed: %s", strerror(errno));
-        }
-      }
-    } else {
-      message.reset();
-    }
+    message.reset();
   }
 
-  uint32_t get_subscription_count() const
+  // Returns the inter-process subscriber count (Agnocast + ROS 2).
+  // Note: ROS 2 subscriber count is updated by the Bridge Manager periodically.
+  // TODO(Koichi98): It just returns the number of Agnocast subscribers for performance bridge.
+  uint32_t get_subscription_count() const { return get_subscription_count_core(topic_name_); }
+
+  // Returns the GID of this publisher which is unique across both Agnocast and ROS 2 publishers.
+  const rmw_gid_t & get_gid() const { return gid_; }
+  // Returns the number of Agnocast intra-process subscribers only; ROS 2 subscribers are not
+  // included.
+  uint32_t get_intra_subscription_count() const
   {
-    return ros2_publisher_->get_subscription_count() + get_subscription_count_core(topic_name_);
+    return get_intra_subscription_count_core(topic_name_);
   }
+
+  const char * get_topic_name() const { return topic_name_.c_str(); }
 };
+
+struct AgnocastToRosRequestPolicy;
+
+template <typename MessageT>
+using Publisher = agnocast::BasicPublisher<MessageT, agnocast::AgnocastToRosRequestPolicy>;
 
 }  // namespace agnocast
