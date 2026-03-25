@@ -1,0 +1,12 @@
+Source: ros-jazzy-agnocast-e2e-test
+Section: misc
+Priority: optional
+Maintainer: Takahiro Ishikawa-Aso <sykwer@gmail.com>
+Build-Depends: debhelper (>= 9.0.0), ros-jazzy-agnocastlib, ros-jazzy-ament-cmake, ros-jazzy-rclcpp, ros-jazzy-rclcpp-components, ros-jazzy-std-msgs, ros-jazzy-ros-workspace
+Homepage: 
+Standards-Version: 3.9.2
+
+Package: ros-jazzy-agnocast-e2e-test
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, ros-jazzy-agnocast-components, ros-jazzy-agnocastlib, ros-jazzy-rclcpp, ros-jazzy-rclcpp-components, ros-jazzy-std-msgs, ros-jazzy-ros-workspace
+Description: E2E test for Agnocast.
