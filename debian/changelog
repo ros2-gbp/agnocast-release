@@ -1,0 +1,79 @@
+ros-jazzy-agnocast-sample-interfaces (2.3.3-1bookworm) bookworm; urgency=high
+
+
+
+ -- Takahiro Ishikawa-Aso <sykwer@gmail.com>  Wed, 01 Apr 2026 15:00:00 -0000
+
+ros-jazzy-agnocast-sample-interfaces (2.3.2-1bookworm) bookworm; urgency=high
+
+
+
+ -- Takahiro Ishikawa-Aso <sykwer@gmail.com>  Mon, 23 Mar 2026 15:00:00 -0000
+
+ros-jazzy-agnocast-sample-interfaces (2.3.1-1bookworm) bookworm; urgency=high
+
+
+
+ -- Takahiro Ishikawa-Aso <sykwer@gmail.com>  Mon, 16 Mar 2026 15:00:00 -0000
+
+ros-jazzy-agnocast-sample-interfaces (2.3.0-1bookworm) bookworm; urgency=high
+
+
+
+ -- Takahiro Ishikawa-Aso <sykwer@gmail.com>  Sun, 08 Mar 2026 15:00:00 -0000
+
+ros-jazzy-agnocast-sample-interfaces (2.2.0-1bookworm) bookworm; urgency=high
+
+  * chore: add sample service/client application (#709 <https://github.com/tier4/agnocast/issues/709>)
+
+ -- Takahiro Ishikawa-Aso <sykwer@gmail.com>  Wed, 18 Feb 2026 15:00:00 -0000
+
+ros-jazzy-agnocast-sample-interfaces (2.1.2-1bookworm) bookworm; urgency=high
+
+
+
+ -- Takahiro Ishikawa-Aso <sykwer@gmail.com>  Sun, 17 Aug 2025 15:00:00 -0000
+
+ros-jazzy-agnocast-sample-interfaces (2.1.1-1bookworm) bookworm; urgency=high
+
+
+
+ -- Takahiro Ishikawa-Aso <sykwer@gmail.com>  Mon, 12 May 2025 15:00:00 -0000
+
+ros-jazzy-agnocast-sample-interfaces (2.1.0-1bookworm) bookworm; urgency=high
+
+
+
+ -- Takahiro Ishikawa-Aso <sykwer@gmail.com>  Mon, 14 Apr 2025 15:00:00 -0000
+
+ros-jazzy-agnocast-sample-interfaces (2.0.1-1bookworm) bookworm; urgency=high
+
+
+
+ -- Takahiro Ishikawa-Aso <sykwer@gmail.com>  Wed, 02 Apr 2025 15:00:00 -0000
+
+ros-jazzy-agnocast-sample-interfaces (2.0.0-1bookworm) bookworm; urgency=high
+
+
+
+ -- Takahiro Ishikawa-Aso <sykwer@gmail.com>  Tue, 01 Apr 2025 15:00:00 -0000
+
+ros-jazzy-agnocast-sample-interfaces (1.0.2-1bookworm) bookworm; urgency=high
+
+
+
+ -- Takahiro Ishikawa-Aso <sykwer@gmail.com>  Thu, 13 Mar 2025 15:00:00 -0000
+
+ros-jazzy-agnocast-sample-interfaces (1.0.1-1bookworm) bookworm; urgency=high
+
+
+
+ -- Takahiro Ishikawa-Aso <sykwer@gmail.com>  Sun, 09 Mar 2025 15:00:00 -0000
+
+ros-jazzy-agnocast-sample-interfaces (1.0.0-1bookworm) bookworm; urgency=high
+
+  * First release.
+
+ -- Takahiro Ishikawa-Aso <sykwer@gmail.com>  Sat, 02 Mar 2024 15:00:00 -0000
+
+
