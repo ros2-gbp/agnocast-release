@@ -1,3 +1,36 @@
+## agnocast (jazzy) - 2.3.4-1
+
+The packages in the `agnocast` repository were released into the `jazzy` distro by running `/usr/bin/bloom-release --rosdistro jazzy --track jazzy agnocast` on `Thu, 21 May 2026 04:56:55 -0000`
+
+These packages were released:
+- `agnocast`
+- `agnocast_cie_config_msgs`
+- `agnocast_cie_thread_configurator`
+- `agnocast_components`
+- `agnocast_e2e_test`
+- `agnocast_ioctl_wrapper`
+- `agnocast_sample_application`
+- `agnocast_sample_interfaces`
+- `agnocastlib`
+- `ros2agnocast`
+
+Version of package(s) in repository `agnocast`:
+
+- upstream repository: https://github.com/autowarefoundation/agnocast.git
+- release repository: https://github.com/ros2-gbp/agnocast-release.git
+- rosdistro version: `2.3.3-1`
+- old version: `2.3.3-1`
+- new version: `2.3.4-1`
+
+Versions of tools used:
+
+- bloom version: `0.14.3`
+- catkin_pkg version: `1.1.0`
+- rosdep version: `0.26.0`
+- rosdistro version: `1.0.1`
+- vcstools version: `0.1.42`
+
+
 ## agnocast (humble) - 2.3.4-1
 
 The packages in the `agnocast` repository were released into the `humble` distro by running `/usr/bin/bloom-release --rosdistro humble --track humble agnocast` on `Thu, 21 May 2026 04:53:16 -0000`
