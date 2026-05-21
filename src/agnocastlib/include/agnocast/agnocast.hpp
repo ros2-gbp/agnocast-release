@@ -80,7 +80,7 @@ typename Publisher<MessageT>::SharedPtr create_publisher(
   static_assert(
     std::is_base_of_v<rclcpp::Node, NodeT> || std::is_base_of_v<agnocast::Node, NodeT>,
     "NodeT must be rclcpp::Node or agnocast::Node (or derived from them)");
-  return std::make_shared<BasicPublisher<MessageT, AgnocastToRosRequestPolicy>>(
+  return std::make_shared<BasicPublisher<MessageT, AgnocastToRosPubsubRequestPolicy>>(
     node, topic_name, qos, options);
 }
 
@@ -101,7 +101,7 @@ typename Publisher<MessageT>::SharedPtr create_publisher(
   static_assert(
     std::is_base_of_v<rclcpp::Node, NodeT> || std::is_base_of_v<agnocast::Node, NodeT>,
     "NodeT must be rclcpp::Node or agnocast::Node (or derived from them)");
-  return std::make_shared<BasicPublisher<MessageT, AgnocastToRosRequestPolicy>>(
+  return std::make_shared<BasicPublisher<MessageT, AgnocastToRosPubsubRequestPolicy>>(
     node, topic_name, rclcpp::QoS(rclcpp::KeepLast(qos_history_depth)), options);
 }
 
@@ -124,7 +124,7 @@ typename Subscription<MessageT>::SharedPtr create_subscription(
   static_assert(
     std::is_base_of_v<rclcpp::Node, NodeT> || std::is_base_of_v<agnocast::Node, NodeT>,
     "NodeT must be rclcpp::Node or agnocast::Node (or derived from them)");
-  return std::make_shared<BasicSubscription<MessageT, RosToAgnocastRequestPolicy>>(
+  return std::make_shared<BasicSubscription<MessageT, RosToAgnocastPubsubRequestPolicy>>(
     node, topic_name, qos, std::forward<Func>(callback), options);
 }
 
@@ -147,7 +147,7 @@ typename Subscription<MessageT>::SharedPtr create_subscription(
   static_assert(
     std::is_base_of_v<rclcpp::Node, NodeT> || std::is_base_of_v<agnocast::Node, NodeT>,
     "NodeT must be rclcpp::Node or agnocast::Node (or derived from them)");
-  return std::make_shared<BasicSubscription<MessageT, RosToAgnocastRequestPolicy>>(
+  return std::make_shared<BasicSubscription<MessageT, RosToAgnocastPubsubRequestPolicy>>(
     node, topic_name, rclcpp::QoS(rclcpp::KeepLast(qos_history_depth)),
     std::forward<Func>(callback), options);
 }
@@ -167,7 +167,7 @@ typename PollingSubscriber<MessageT>::SharedPtr create_subscription(
   static_assert(
     std::is_base_of_v<rclcpp::Node, NodeT> || std::is_base_of_v<agnocast::Node, NodeT>,
     "NodeT must be rclcpp::Node or agnocast::Node (or derived from them)");
-  return std::make_shared<BasicPollingSubscriber<MessageT, RosToAgnocastRequestPolicy>>(
+  return std::make_shared<BasicPollingSubscriber<MessageT, RosToAgnocastPubsubRequestPolicy>>(
     node, topic_name, rclcpp::QoS(rclcpp::KeepLast(qos_history_depth)));
 }
 
@@ -186,7 +186,7 @@ typename PollingSubscriber<MessageT>::SharedPtr create_subscription(
   static_assert(
     std::is_base_of_v<rclcpp::Node, NodeT> || std::is_base_of_v<agnocast::Node, NodeT>,
     "NodeT must be rclcpp::Node or agnocast::Node (or derived from them)");
-  return std::make_shared<BasicPollingSubscriber<MessageT, RosToAgnocastRequestPolicy>>(
+  return std::make_shared<BasicPollingSubscriber<MessageT, RosToAgnocastPubsubRequestPolicy>>(
     node, topic_name, qos);
 }
 
@@ -194,8 +194,8 @@ typename PollingSubscriber<MessageT>::SharedPtr create_subscription(
 /// @tparam ServiceT ROS service type.
 /// @param node Pointer to rclcpp::Node.
 /// @param service_name Service name.
-/// @param qos Quality of service profile.
-/// @param group Callback group (nullptr = default).
+/// @param qos Quality of service profile. Defaults to `rclcpp::ServicesQoS()`.
+/// @param group Callback group. Defaults to `nullptr` (default callback group).
 /// @return Shared pointer to the created client.
 // AGNOCAST_PUBLIC
 template <typename ServiceT>
@@ -203,18 +203,23 @@ typename Client<ServiceT>::SharedPtr create_client(
   rclcpp::Node * node, const std::string & service_name,
   const rclcpp::QoS & qos = rclcpp::ServicesQoS(), rclcpp::CallbackGroup::SharedPtr group = nullptr)
 {
+  RCLCPP_WARN(
+    node->get_logger(),
+    "Agnocast service/client is not officially supported yet and the API may change in the "
+    "future: %s",
+    node->get_node_services_interface()->resolve_service_name(service_name).c_str());
   return std::make_shared<Client<ServiceT>>(node, service_name, qos, group);
 }
 
 /// @brief Create an Agnocast service server (Stage 1 free function).
 /// @tparam ServiceT ROS service type.
-/// @tparam Func Callable with signature `void(const agnocast::ipc_shared_ptr<const RequestT>&,
-/// agnocast::ipc_shared_ptr<ResponseT>&)`.
+/// @tparam Func Callable that takes `ipc_shared_ptr<ServiceT::Request>` and
+/// `ipc_shared_ptr<ServiceT::Response>` (const&, &&, or by-value) (return value ignored).
 /// @param node Pointer to rclcpp::Node.
 /// @param service_name Service name.
 /// @param callback Callback invoked on each request.
-/// @param qos Quality of service profile.
-/// @param group Callback group (nullptr = default).
+/// @param qos Quality of service profile. Defaults to `rclcpp::ServicesQoS()`.
+/// @param group Callback group. Defaults to `nullptr` (default callback group).
 /// @return Shared pointer to the created service.
 // AGNOCAST_PUBLIC
 template <typename ServiceT, typename Func>
@@ -222,6 +227,11 @@ typename Service<ServiceT>::SharedPtr create_service(
   rclcpp::Node * node, const std::string & service_name, Func && callback,
   const rclcpp::QoS & qos = rclcpp::ServicesQoS(), rclcpp::CallbackGroup::SharedPtr group = nullptr)
 {
+  RCLCPP_WARN(
+    node->get_logger(),
+    "Agnocast service/client is not officially supported yet and the API may change in the "
+    "future: %s",
+    node->get_node_services_interface()->resolve_service_name(service_name).c_str());
   return std::make_shared<Service<ServiceT>>(
     node, service_name, std::forward<Func>(callback), qos, group);
 }

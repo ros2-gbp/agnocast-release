@@ -1,8 +1,8 @@
 import os
+import time
 import unittest
 
 import launch_testing
-import launch_testing.asserts
 import launch_testing.markers
 import yaml
 from launch import LaunchDescription
@@ -19,6 +19,9 @@ QOS_DEPTH = 10
 PUB_NUM = int(QOS_DEPTH / 2)
 TIMEOUT = float(os.environ.get('STRESS_TEST_TIMEOUT', 8.0))
 FOREVER = True if (os.environ.get('STRESS_TEST_TIMEOUT')) else False
+# ReadyToTest must fire within launch_testing's ~15s limit; the stress soak
+# is done in Test2To2.setUpClass.
+READY_TO_TEST_DELAY = 8.0
 
 BRIDGE_MODE = os.environ.get('AGNOCAST_BRIDGE_MODE', 'off').lower()
 IS_STANDARD_BRIDGE = (BRIDGE_MODE == '1' or BRIDGE_MODE == 'standard')
@@ -137,7 +140,7 @@ def generate_test_description():
             [
                 SetEnvironmentVariable('RCUTILS_LOGGING_BUFFERED_STREAM', '0'),
                 *containers,
-                TimerAction(period=TIMEOUT, actions=[launch_testing.actions.ReadyToTest()])
+                TimerAction(period=READY_TO_TEST_DELAY, actions=[launch_testing.actions.ReadyToTest()])
             ]
         ), testing_processes
     )
@@ -147,29 +150,36 @@ class Test2To2(unittest.TestCase):
     pub_i_ = 0
     sub_i_ = 0
 
+    @classmethod
+    def setUpClass(cls):
+        # Stress soak: forever=True nodes keep running while we sleep here.
+        if FOREVER:
+            time.sleep(TIMEOUT)
+
     def common_assert(self, proc_output, container_proc, nodes):
         if not nodes:
             return
 
-        with launch_testing.asserts.assertSequentialStdout(proc_output, process=container_proc) as cm:
-            proc_output = "".join(cm._output)
+        output_text = "".join(
+            output.text.decode('utf-8') for output in proc_output[container_proc]
+        )
 
-            # The display order is not guaranteed, so the message order is not checked.
-            for node in nodes:
-                if node == 'p':
-                    prefix = f"[test_talker_node_{self.pub_i_}]: "
-                    for i in range(PUB_NUM):
-                        self.assertEqual(proc_output.count(f"{prefix}Publishing {i}."), 1)
-                    self.assertEqual(proc_output.count(
-                        f"{prefix}All messages published. Shutting down."), 1)
-                    self.pub_i_ += 1
-                else:  # s
-                    prefix = f"[test_listener_node_{self.sub_i_}]: "
-                    for i in range(PUB_NUM):
-                        self.assertEqual(proc_output.count(f"{prefix}Receiving {i}."), 2)
-                    self.assertEqual(proc_output.count(
-                        f"{prefix}All messages received. Shutting down."), 1)
-                    self.sub_i_ += 1
+        # The display order is not guaranteed, so the message order is not checked.
+        for node in nodes:
+            if node == 'p':
+                prefix = f"[test_talker_node_{self.pub_i_}]: "
+                for i in range(PUB_NUM):
+                    self.assertEqual(output_text.count(f"{prefix}Publishing {i}."), 1)
+                self.assertEqual(output_text.count(
+                    f"{prefix}All messages published. Shutting down."), 1)
+                self.pub_i_ += 1
+            else:  # s
+                prefix = f"[test_listener_node_{self.sub_i_}]: "
+                for i in range(PUB_NUM):
+                    self.assertEqual(output_text.count(f"{prefix}Receiving {i}."), 2)
+                self.assertEqual(output_text.count(
+                    f"{prefix}All messages received. Shutting down."), 1)
+                self.sub_i_ += 1
 
     def test_all_container(self, proc_output, container0, container1, container2, container3):
         nodes = CONFIG['container0']
