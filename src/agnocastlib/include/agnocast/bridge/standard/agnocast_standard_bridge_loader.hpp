@@ -5,41 +5,61 @@
 
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 
 namespace agnocast
 {
 
-class BridgeBase;
+class PubsubBridgeBase;
+class ServiceBridgeBase;
 
-using BridgeFn = std::shared_ptr<BridgeBase> (*)(
-  rclcpp::Node::SharedPtr, const BridgeTargetInfo &, const rclcpp::QoS &);
+using PubsubBridgeFn = std::shared_ptr<PubsubBridgeBase> (*)(
+  rclcpp::Node::SharedPtr, const std::string &, const rclcpp::QoS &);
+using ServiceBridgeFn = std::shared_ptr<ServiceBridgeBase> (*)(
+  rclcpp::Node::SharedPtr, const std::string &, const rclcpp::QoS &);
+
+struct BridgeFactorySpec
+{
+  // If set to std::nullopt, the factory functions reside in the main executable.
+  std::optional<std::string> shared_lib_path;
+  uintptr_t fn_offset_r2a;
+  uintptr_t fn_offset_a2r;
+};
 
 class StandardBridgeLoader
 {
 public:
-  explicit StandardBridgeLoader(const rclcpp::Logger & logger);
+  explicit StandardBridgeLoader(
+    rclcpp::Node::SharedPtr container_node, const rclcpp::Logger & logger);
   ~StandardBridgeLoader();
 
   StandardBridgeLoader(const StandardBridgeLoader &) = delete;
   StandardBridgeLoader & operator=(const StandardBridgeLoader &) = delete;
 
-  std::shared_ptr<BridgeBase> create(
-    const MqMsgBridge & req, const std::string & topic_name_with_direction,
-    const rclcpp::Node::SharedPtr & node, const rclcpp::QoS & qos);
+  std::shared_ptr<PubsubBridgeBase> start_pubsub_bridge(
+    const std::string & topic_name, BridgeDirection direction,
+    const BridgeFactorySpec & factory_spec, const rclcpp::QoS & qos);
+  std::shared_ptr<ServiceBridgeBase> start_service_bridge(
+    const std::string & service_name, BridgeDirection direction,
+    const BridgeFactorySpec & factory_spec, const rclcpp::QoS & qos);
 
 private:
+  rclcpp::Node::SharedPtr container_node_;
   rclcpp::Logger logger_;
 
-  std::map<std::string, std::pair<BridgeFn, std::shared_ptr<void>>> cached_factories_;
+  std::map<std::string, std::pair<uintptr_t, std::shared_ptr<void>>> cached_factories_;
 
-  std::shared_ptr<BridgeBase> create_bridge_instance(
-    BridgeFn entry_func, const std::shared_ptr<void> & lib_handle,
-    const rclcpp::Node::SharedPtr & node, const BridgeTargetInfo & target, const rclcpp::QoS & qos);
-  static std::pair<void *, uintptr_t> load_library(const char * lib_path, const char * symbol_name);
-  std::pair<BridgeFn, std::shared_ptr<void>> resolve_factory_function(
-    const MqMsgBridge & req, const std::string & topic_name_with_direction);
+  template <typename BridgeBaseT, typename BridgeFnT>
+  std::shared_ptr<BridgeBaseT> create_bridge_instance(
+    BridgeFnT entry_func, const std::shared_ptr<void> & lib_handle, const std::string & name,
+    const rclcpp::QoS & qos);
+  static std::pair<void *, uintptr_t> load_library(
+    const std::optional<std::string> & shared_lib_path);
+  std::pair<uintptr_t, std::shared_ptr<void>> resolve_factory_function(
+    const std::string & name, BridgeDirection direction, const BridgeFactorySpec & factory_spec,
+    bool is_service);
   static bool is_address_in_library_code_segment(void * handle, uintptr_t addr);
 };
 
