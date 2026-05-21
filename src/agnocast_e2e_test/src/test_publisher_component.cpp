@@ -4,11 +4,12 @@
 
 #include <std_msgs/msg/string.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <thread>
 
-namespace agnocastlib_test
+namespace agnocast_e2e_test
 {
 
 class TestPublisherComponent : public rclcpp::Node
@@ -45,13 +46,21 @@ public:
 
   ~TestPublisherComponent()
   {
+    stop_non_ros_thread_.store(true);
     if (non_ros_thread_.joinable()) {
       non_ros_thread_.join();
     }
   }
 
 private:
-  void non_ros_thread_func() {}
+  // Kept alive so the configurator's reapply path has a live tid to operate
+  // on; an empty body would let the thread exit and syscalls would get ESRCH.
+  void non_ros_thread_func()
+  {
+    while (!stop_non_ros_thread_.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  }
 
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr publisher_;
   rclcpp::TimerBase::SharedPtr timer_;
@@ -60,8 +69,9 @@ private:
   int count_;
 
   std::thread non_ros_thread_;
+  std::atomic<bool> stop_non_ros_thread_{false};
 };
 
-}  // namespace agnocastlib_test
+}  // namespace agnocast_e2e_test
 
-RCLCPP_COMPONENTS_REGISTER_NODE(agnocastlib_test::TestPublisherComponent)
+RCLCPP_COMPONENTS_REGISTER_NODE(agnocast_e2e_test::TestPublisherComponent)
